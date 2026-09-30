@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 
 import gi
@@ -70,17 +71,89 @@ def process_cpu_percent() -> float:
     return _cpu_percent
 
 
-# Hold at most two decoded frames. If drawing falls behind, older frames are
-# thrown away instead of piling up, so the picture never lags behind live.
-# Frames are paced by their camera timestamps (after rtspsrc's jitter buffer has
-# smoothed them) so motion is even. The queue absorbs network bursts; if drawing
-# ever falls behind by more than ~0.4 s, the oldest frames are dropped instead of
-# the picture drifting further behind live.
-LEAKY_QUEUE = (
-    "queue name=q max-size-buffers=10 max-size-bytes=0 max-size-time=400000000 leaky=downstream"
-)
-# REOLINK_VIEWER_SYNC=0 shows frames the instant they're decoded (lowest latency, uneven motion).
+# Decoded frames wait here for the pacer. If drawing or pacing ever falls far
+# behind, the oldest frames are thrown away instead of piling up.
+LEAKY_QUEUE = "queue name=q max-size-buffers=25 max-size-bytes=0 max-size-time=0 leaky=downstream"
+# REOLINK_VIEWER_SYNC=0 disables pacing: frames show the instant they're decoded.
 PACED = os.environ.get("REOLINK_VIEWER_SYNC", "1") != "0"
+
+
+class FramePacer:
+    """Evens out frame display timing for cameras that send frames in bursts.
+
+    Camera timestamps can't be trusted (Reolink's run fast/slow and arrive in
+    bursts), so this ignores them. It learns the real frame interval from arrival
+    times, keeps a small cushion of frames queued, and releases one frame per
+    interval from the queue's own thread. The release rate is nudged up or down
+    by up to 10% to hold the cushion steady, so lag never creeps up.
+    """
+
+    # The cushion (frames held back) adapts to the longest recent pause between
+    # frame arrivals, so it's as small as the camera allows.
+    MIN_CUSHION = 0.10
+    MAX_CUSHION = 0.80
+    EXTRA_LAG = 0.50  # frames later than cushion + this are dropped to get back to live
+
+    def __init__(self, queue: Gst.Element):
+        self.dropped = 0
+        self._interval: float | None = None
+        self._last_arrival: float | None = None
+        self._arrivals: dict[int, float] = {}
+        self._next: float | None = None
+        self._gap_peak = 0.0
+        self._wake = threading.Event()
+        queue.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_arrive)
+        queue.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._on_release)
+
+    def reset(self) -> None:
+        """Forget the schedule (on (re)connect); the learned frame rate is kept."""
+        self._next = None
+        self._last_arrival = None
+        self._arrivals.clear()
+        self._wake.clear()
+
+    @property
+    def cushion(self) -> float:
+        return min(self.MAX_CUSHION, max(self.MIN_CUSHION, 1.2 * self._gap_peak))
+
+    def interrupt(self) -> None:
+        """Cut short any wait so the pipeline can stop promptly."""
+        self._wake.set()
+
+    def _on_arrive(self, _pad, info):
+        now = time.monotonic()
+        if self._last_arrival is not None:
+            gap = now - self._last_arrival
+            if gap < 1.0:  # ignore reconnect gaps; bursts and pauses average out
+                self._interval = gap if self._interval is None else 0.98 * self._interval + 0.02 * gap
+                # Remember the longest pause, fading over roughly a minute.
+                self._gap_peak = max(gap, self._gap_peak * 0.998)
+        self._last_arrival = now
+        if len(self._arrivals) > 200:
+            self._arrivals.clear()
+        self._arrivals[info.get_buffer().pts] = now
+        return Gst.PadProbeReturn.OK
+
+    def _on_release(self, _pad, info):
+        now = time.monotonic()
+        arrived = self._arrivals.pop(info.get_buffer().pts, now)
+        cushion = self.cushion
+        if now - arrived > cushion + self.EXTRA_LAG:
+            self._next = None
+            self.dropped += 1
+            return Gst.PadProbeReturn.DROP
+        interval = min(max(self._interval or 0.04, 0.01), 0.5)
+        if self._next is None or self._next < now - interval:
+            # First frame, or we ran dry: restart the schedule with a fresh cushion.
+            target = max(now, arrived + cushion)
+        else:
+            target = self._next
+        if target > now and not self._wake.is_set():
+            self._wake.wait(target - now)
+        lag = target - arrived
+        speedup = max(-0.1, min(0.1, 0.1 * (lag - cushion) / cushion))
+        self._next = target + interval * (1 - speedup)
+        return Gst.PadProbeReturn.OK
 
 
 class VideoSink:
@@ -96,17 +169,16 @@ class VideoSink:
         # glsinkbin wraps the real sink; its widget and stats live on the gtkglsink.
         self.sink = gtk_sink or inner
         self.widget: Gtk.Widget = self.sink.props.widget
+        # Frames are shown as soon as the pacer releases them; the camera's own
+        # timestamps are too unreliable to schedule by.
         for el in {inner, self.sink}:
-            el.set_property("sync", PACED)
-        if PACED:
-            # Show late frames anyway rather than skipping them; skipping is what
-            # makes a clock/counter in the picture visibly jump.
-            self.sink.set_property("max-lateness", -1)
-            self.sink.set_property("qos", False)
+            el.set_property("sync", False)
+        queue = bin_.get_by_name("q")
+        self.pacer = FramePacer(queue) if PACED else None
         self.widget.set_hexpand(True)
         self.widget.set_vexpand(True)
         self.queue_drops = 0
-        bin_.get_by_name("q").connect("overrun", self._on_overrun)
+        queue.connect("overrun", self._on_overrun)
         self._scale = bin_.get_by_name("scale")
         self._caps_prefix = caps_prefix
         self._target_width = 0
@@ -117,7 +189,8 @@ class VideoSink:
     def counters(self) -> tuple[int, int]:
         """(rendered, dropped) frame totals since the sink started."""
         stats = self.sink.get_property("stats")
-        return stats.get_value("rendered"), stats.get_value("dropped") + self.queue_drops
+        pacer_drops = self.pacer.dropped if self.pacer else 0
+        return stats.get_value("rendered"), stats.get_value("dropped") + self.queue_drops + pacer_drops
 
     def set_target_width(self, width: int) -> None:
         """Scale frames to this width before drawing (no-op for the GL path)."""
@@ -315,7 +388,7 @@ class CameraTile(Gtk.EventBox):
             self._set_status("No URL configured")
             return
         log.info("[%s] connecting to %s", self.camera.name, self.camera.display_url(self.active_stream))
-        self._playbin.set_state(Gst.State.NULL)
+        self._stop_pipeline()
         self._playbin.set_property("uri", uri)
         self._set_status("Connecting…")
         if self._playbin.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -329,7 +402,7 @@ class CameraTile(Gtk.EventBox):
     def stop(self) -> None:
         self._wanted = False
         self._cancel_retry()
-        self._playbin.set_state(Gst.State.NULL)
+        self._stop_pipeline()
         self._set_status("Stopped")
 
     def restart(self) -> None:
@@ -369,7 +442,7 @@ class CameraTile(Gtk.EventBox):
         self._wanted = False
         self._cancel_retry()
         if self._playbin is not None:
-            self._playbin.set_state(Gst.State.NULL)
+            self._stop_pipeline()
             self._last_buffer = None
             bus = self._playbin.get_bus()
             bus.disconnect(self._bus_handler)
@@ -377,6 +450,13 @@ class CameraTile(Gtk.EventBox):
             self._playbin = None
 
     # ----------------------------------------------------------------- internal
+
+    def _stop_pipeline(self) -> None:
+        if self._sink is not None and self._sink.pacer is not None:
+            self._sink.pacer.interrupt()
+        self._playbin.set_state(Gst.State.NULL)
+        if self._sink is not None and self._sink.pacer is not None:
+            self._sink.pacer.reset()
 
     def _install_sink(self, sink: VideoSink) -> None:
         """Attach a video sink to playbin and show its widget. Playbin must be in NULL."""
@@ -476,7 +556,7 @@ class CameraTile(Gtk.EventBox):
     def _fall_back(self) -> None:
         failed = self._sink.kind
         _failed_kinds.add(failed)
-        self._playbin.set_state(Gst.State.NULL)
+        self._stop_pipeline()
         try:
             sink = make_video_sink()
         except NoVideoOutput as exc:
@@ -497,11 +577,12 @@ class CameraTile(Gtk.EventBox):
             prev_r, prev_d = self._last_counters
             if rendered >= prev_r:
                 log.debug(
-                    "[%s] %.1f fps shown, %d dropped (%s output), app CPU %.0f%%",
+                    "[%s] %.1f fps shown, %d dropped (%s output), smoothing buffer %s, app CPU %.0f%%",
                     self.camera.name,
                     (rendered - prev_r) / WATCHDOG_INTERVAL_S,
                     dropped - prev_d,
                     self._sink.kind,
+                    f"{self._sink.pacer.cushion:.2f}s" if self._sink.pacer else "off",
                     process_cpu_percent(),
                 )
             self._last_counters = (rendered, dropped)
@@ -517,7 +598,7 @@ class CameraTile(Gtk.EventBox):
     def _schedule_reconnect(self, reason: str) -> None:
         if self._playbin is None:
             return
-        self._playbin.set_state(Gst.State.NULL)
+        self._stop_pipeline()
         if not self._wanted or self._retry_id:
             return
         delay = self._backoff
