@@ -74,7 +74,11 @@ Cameras are stored in `~/.config/reolink-viewer/config.json`. The file is create
 
 - **`Unauthorized`**: the username or password is wrong. Special characters are handled correctly.
 - **Black tile or `No video`**: make sure RTSP is enabled on the camera. Also try the H.265 codec setting, or switch the protocol to RTMP/FLV. Newer battery cameras and some doorbells only stream through a Home Hub or NVR.
-- **High CPU with many main streams**: keep the grid on sub streams (the default). Installing `gstreamer1.0-vaapi` (Intel/AMD) enables hardware decoding.
+- **Choppy video**: run `reolink-viewer -v` from a terminal. Every 5 seconds each camera logs `NN fps shown, N dropped (gl|sw output)` and names its decoder, which tells you whether the network, decoding or display is the bottleneck. Things to try:
+  - Switch **Protocol** to **HTTP-FLV** (port 80). Reolink's RTSP implementation is often the weakest option.
+  - In the Reolink app, set the camera's Clear stream to a fixed frame rate (20–25), and consider a 4 Mbps+ bitrate over a wired connection.
+  - The app draws video with the GPU (OpenGL) and falls back to software automatically. To force software rendering, run `REOLINK_VIEWER_SINK=sw reolink-viewer`.
+- **High CPU with many main streams**: keep the grid on sub streams (the default). Hardware decoding needs working VA-API drivers (`sudo apt install vainfo && vainfo`).
 - For detailed logs, run `reolink-viewer -v` from a terminal. For GStreamer-level logs, add `GST_DEBUG=3`.
 
 ## Development

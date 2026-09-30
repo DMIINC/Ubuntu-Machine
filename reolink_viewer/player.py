@@ -3,33 +3,87 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gst, Gtk  # noqa: E402
+gi.require_version("GstVideo", "1.0")
+from gi.repository import GLib, Gst, GstVideo, Gtk  # noqa: E402
 
 from .config import Camera  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-RTSP_LATENCY_MS = 200
+RTSP_LATENCY_MS = 300
 RETRY_MIN_S = 2
 RETRY_MAX_S = 30
 STALL_TIMEOUT_S = 20
 WATCHDOG_INTERVAL_S = 5
 
 
-def make_video_sink() -> Gst.Element:
-    sink = Gst.ElementFactory.make("gtksink", None)
-    if sink is None:
+# "auto" tries GPU rendering (gtkglsink) and falls back to software (gtksink).
+SINK_MODE = os.environ.get("REOLINK_VIEWER_SINK", "auto").lower()
+_gl_failed = False
+
+
+class VideoSink:
+    """The element handed to playbin plus the GTK widget that shows its frames."""
+
+    def __init__(self, kind: str, element: Gst.Element, sink: Gst.Element):
+        self.kind = kind
+        self.element = element
+        self.sink = sink
+        self.widget: Gtk.Widget = sink.props.widget
+        # Live view: show each frame as soon as it's decoded instead of dropping
+        # it when camera timestamps jitter (the main cause of choppy playback).
+        sink.set_property("sync", False)
+        self.widget.set_hexpand(True)
+        self.widget.set_vexpand(True)
+
+    def counters(self) -> tuple[int, int]:
+        """(rendered, dropped) frame totals since the sink started."""
+        stats = self.sink.get_property("stats")
+        return stats.get_value("rendered"), stats.get_value("dropped")
+
+    def contains(self, obj) -> bool:
+        while obj is not None:
+            if obj is self.element:
+                return True
+            obj = obj.get_parent()
+        return False
+
+
+def _make_gl_sink() -> VideoSink | None:
+    glsink = Gst.ElementFactory.make("gtkglsink", None)
+    glbin = Gst.ElementFactory.make("glsinkbin", None)
+    if glsink is None or glbin is None:
+        return None
+    glbin.set_property("sink", glsink)
+    return VideoSink("gl", glbin, glsink)
+
+
+def _make_sw_sink() -> VideoSink:
+    if Gst.ElementFactory.find("gtksink") is None:
         raise RuntimeError(
             "GStreamer 'gtksink' element not found. Install it with:\n"
             "  sudo apt install gstreamer1.0-gtk3"
         )
-    return sink
+    # Multithreaded colour conversion; single-threaded is far too slow for 4K.
+    bin_ = Gst.parse_bin_from_description(
+        "videoconvert n-threads=0 ! gtksink name=sink", True
+    )
+    return VideoSink("sw", bin_, bin_.get_by_name("sink"))
+
+
+def make_video_sink() -> VideoSink:
+    if SINK_MODE != "sw" and not _gl_failed:
+        sink = _make_gl_sink()
+        if sink is not None:
+            return sink
+    return _make_sw_sink()
 
 
 class CameraTile(Gtk.EventBox):
@@ -49,38 +103,33 @@ class CameraTile(Gtk.EventBox):
         # Let the event box receive clicks on top of the video widget.
         self.set_above_child(True)
 
-        overlay = Gtk.Overlay()
-        overlay.get_style_context().add_class("camera-bg")
-        self.add(overlay)
-
-        self._sink = make_video_sink()
-        video = self._sink.props.widget
-        video.set_hexpand(True)
-        video.set_vexpand(True)
-        overlay.add(video)
+        self._overlay = Gtk.Overlay()
+        self._overlay.get_style_context().add_class("camera-bg")
+        self.add(self._overlay)
+        self._sink: VideoSink | None = None
+        self._last_buffer: Gst.Buffer | None = None
+        self._last_counters = (0, 0)
 
         self._label = Gtk.Label(xalign=0)
         self._label.set_halign(Gtk.Align.START)
         self._label.set_valign(Gtk.Align.START)
         self._label.get_style_context().add_class("camera-label")
-        overlay.add_overlay(self._label)
+        self._overlay.add_overlay(self._label)
 
         self._playbin = Gst.ElementFactory.make("playbin", None)
         if self._playbin is None:
             raise RuntimeError(
                 "GStreamer 'playbin' not found. Install gstreamer1.0-plugins-base."
             )
-        self._playbin.set_property("video-sink", self._sink)
         self._playbin.connect("source-setup", self._on_source_setup)
+        self._playbin.connect("deep-element-added", self._on_element_added)
+        self._install_sink(make_video_sink())
         self._apply_audio_flag()
 
         bus = self._playbin.get_bus()
         bus.add_signal_watch()
         self._bus_handler = bus.connect("message", self._on_bus_message)
 
-        self._sink.get_static_pad("sink").add_probe(
-            Gst.PadProbeType.BUFFER, self._on_buffer
-        )
         self._watchdog_id = GLib.timeout_add_seconds(WATCHDOG_INTERVAL_S, self._watchdog)
         self.connect("destroy", lambda *_: self.dispose())
         self._update_label()
@@ -132,6 +181,11 @@ class CameraTile(Gtk.EventBox):
         self._playbin.set_property("uri", uri)
         self._set_status("Connecting…")
         if self._playbin.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            if self._sink.kind == "gl":
+                # A synchronous failure here is almost always the GL sink being
+                # unable to get an OpenGL context on this system.
+                self._fall_back_to_software()
+                return
             self._schedule_reconnect("Failed to start")
 
     def stop(self) -> None:
@@ -146,10 +200,20 @@ class CameraTile(Gtk.EventBox):
 
     def snapshot_png(self) -> bytes | None:
         """Return the current frame as PNG bytes, or None if nothing is playing."""
-        sample = self._playbin.emit("convert-sample", Gst.Caps.from_string("image/png"))
-        if sample is None:
+        buf = self._last_buffer
+        caps = self._sink.element.get_static_pad("sink").get_current_caps() if self._sink else None
+        if buf is None or caps is None:
             return None
-        buf = sample.get_buffer()
+        try:
+            png = GstVideo.video_convert_sample(
+                Gst.Sample.new(buf, caps, None, None),
+                Gst.Caps.from_string("image/png"),
+                5 * Gst.SECOND,
+            )
+        except GLib.Error as exc:
+            log.warning("[%s] snapshot failed: %s", self.camera.name, exc.message)
+            return None
+        buf = png.get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
         if not ok:
             return None
@@ -166,12 +230,30 @@ class CameraTile(Gtk.EventBox):
         self._cancel_retry()
         if self._playbin is not None:
             self._playbin.set_state(Gst.State.NULL)
+            self._last_buffer = None
             bus = self._playbin.get_bus()
             bus.disconnect(self._bus_handler)
             bus.remove_signal_watch()
             self._playbin = None
 
     # ----------------------------------------------------------------- internal
+
+    def _install_sink(self, sink: VideoSink) -> None:
+        """Attach a video sink to playbin and show its widget. Playbin must be in NULL."""
+        if self._sink is not None:
+            self._overlay.remove(self._sink.widget)
+        self._sink = sink
+        self._last_buffer = None
+        self._playbin.set_property("video-sink", sink.element)
+        sink.element.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_buffer)
+        self._overlay.add(sink.widget)
+        sink.widget.show()
+        log.debug("[%s] using %s video output", self.camera.name, sink.kind)
+
+    def _on_element_added(self, _bin, _sub, element) -> None:
+        factory = element.get_factory()
+        if factory and "Codec/Decoder" in (factory.get_metadata("klass") or ""):
+            log.info("[%s] decoder: %s", self.camera.name, factory.get_name())
 
     def _apply_audio_flag(self) -> None:
         flags = "video+audio+soft-volume" if self.camera.audio else "video"
@@ -187,9 +269,10 @@ class CameraTile(Gtk.EventBox):
         elif name in ("souphttpsrc",):
             source.set_property("is-live", True)
 
-    def _on_buffer(self, _pad, _info):
+    def _on_buffer(self, _pad, info):
         # Runs on a streaming thread: only touch simple attributes here.
         self._last_frame = time.monotonic()
+        self._last_buffer = info.get_buffer()
         if not self._got_frame:
             self._got_frame = True
             GLib.idle_add(self._on_first_frame)
@@ -205,12 +288,36 @@ class CameraTile(Gtk.EventBox):
         if msg.type == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
             log.warning("[%s] error: %s (%s)", self.camera.name, err.message, debug)
+            if self._sink.kind == "gl" and self._sink.contains(msg.src):
+                self._fall_back_to_software()
+                return
             self._schedule_reconnect(err.message)
         elif msg.type == Gst.MessageType.EOS:
             log.info("[%s] end of stream", self.camera.name)
             self._schedule_reconnect("Stream ended")
 
+    def _fall_back_to_software(self) -> None:
+        global _gl_failed
+        _gl_failed = True
+        log.warning("GPU video output failed; switching to software rendering")
+        self._playbin.set_state(Gst.State.NULL)
+        self._install_sink(_make_sw_sink())
+        if self._wanted:
+            self.start()
+
     def _watchdog(self) -> bool:
+        if self._wanted and self._got_frame and log.isEnabledFor(logging.DEBUG):
+            rendered, dropped = self._sink.counters()
+            prev_r, prev_d = self._last_counters
+            if rendered >= prev_r:
+                log.debug(
+                    "[%s] %.1f fps shown, %d dropped (%s output)",
+                    self.camera.name,
+                    (rendered - prev_r) / WATCHDOG_INTERVAL_S,
+                    dropped - prev_d,
+                    self._sink.kind,
+                )
+            self._last_counters = (rendered, dropped)
         if (
             self._wanted
             and not self._retry_id
