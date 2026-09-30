@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Reolink Viewer
+Comment=Watch live streams from Reolink cameras and NVRs
+Exec=reolink-viewer %U
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=reolink;camera;cctv;rtsp;security;
+StartupNotify=true

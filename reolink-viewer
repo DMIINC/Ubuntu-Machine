@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launcher: runs the app from wherever this script (or its install dir) lives.
+HERE="$(dirname "$(readlink -f "$0")")"
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m reolink_viewer "$@"
