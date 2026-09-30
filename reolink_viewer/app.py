@@ -25,6 +25,7 @@ from .config import (  # noqa: E402
     save_settings,
 )
 from .dialogs import CameraDialog  # noqa: E402
+from . import player  # noqa: E402
 from .player import CameraTile  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -33,11 +34,9 @@ CSS = b"""
 .camera-bg { background-color: #000000; }
 .camera-grid { background-color: #1a1a1a; }
 .camera-label {
-    background-color: rgba(0, 0, 0, 0.55);
+    background-color: #111111;
     color: #ffffff;
-    padding: 2px 8px;
-    margin: 6px;
-    border-radius: 4px;
+    padding: 3px 8px;
     font-size: 90%;
 }
 .empty-state { font-size: 120%; }
@@ -257,6 +256,10 @@ class MainWindow(Gtk.ApplicationWindow):
         hd.connect("toggled", self._on_hd_toggled)
         menu.append(hd)
 
+        gpu = Gtk.CheckMenuItem(label="GPU only (never use CPU for video)", active=self.settings.gpu_only)
+        gpu.connect("toggled", self._on_gpu_only_toggled)
+        menu.append(gpu)
+
         reconnect = Gtk.MenuItem(label="Reconnect all")
         reconnect.connect("activate", lambda *_: [t.restart() for t in self.tiles.values() if t.is_playing])
         menu.append(reconnect)
@@ -324,6 +327,11 @@ class MainWindow(Gtk.ApplicationWindow):
             self.settings.columns = cols
             self.app.save()
             self.relayout()
+
+    def _on_gpu_only_toggled(self, item: Gtk.CheckMenuItem) -> None:
+        self.settings.gpu_only = item.get_active()
+        self.app.save()
+        self._notify("Restart Reolink Viewer to apply the GPU-only setting.")
 
     def _on_hd_toggled(self, item: Gtk.CheckMenuItem) -> None:
         self.settings.hd_when_maximized = item.get_active()
@@ -409,6 +417,7 @@ class ViewerApp(Gtk.Application):
 
     def do_activate(self):
         if self.window is None:
+            player.configure(self.settings.gpu_only)
             self.window = MainWindow(self)
         self.window.present()
 

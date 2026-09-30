@@ -10,8 +10,9 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 gi.require_version("GstVideo", "1.0")
-from gi.repository import GLib, Gst, GstVideo, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gst, GstVideo, Gtk  # noqa: E402
 
 from .config import Camera  # noqa: E402
 
@@ -25,13 +26,49 @@ WATCHDOG_INTERVAL_S = 5
 
 
 # Video output paths, best first. Each one that fails is skipped from then on:
+#   wayland - gtkwaylandsink: frames go straight to the compositor as a subsurface,
+#             which converts and scales them on the GPU (Wayland sessions only)
 #   gl   - gtkglsink: GPU scales and draws (Intel/AMD, X11)
 #   cuda - NVIDIA GPU converts + scales to the window size, gtksink draws the result
 #   cpu  - multithreaded convert + scale to the window size, gtksink draws
 # REOLINK_VIEWER_SINK=gl|cuda|cpu forces a path ("sw" is an alias for cpu).
-SINK_ORDER = ("gl", "cuda", "cpu")
+SINK_ORDER = ("wayland", "gl", "cuda", "cpu")
 SINK_MODE = os.environ.get("REOLINK_VIEWER_SINK", "auto").lower().replace("sw", "cpu")
 _failed_kinds: set[str] = set()
+
+# GPU-only mode: software video decoders are disabled and the CPU conversion /
+# drawing paths are never used. Set by the app from its settings.
+GPU_ONLY = False
+CPU_KINDS = ("cuda", "cpu")  # both paint the final frame with the CPU (cairo)
+
+
+def configure(gpu_only: bool) -> None:
+    """Apply GPU-only mode. Call once after Gst.init(), before creating tiles."""
+    global GPU_ONLY
+    GPU_ONLY = gpu_only
+    for factory in Gst.Registry.get().get_feature_list(Gst.ElementFactory):
+        klass = factory.get_metadata("klass") or ""
+        if "Decoder/Video" in klass and "Hardware" not in klass:
+            if gpu_only:
+                factory.set_rank(Gst.Rank.NONE)
+    if gpu_only:
+        log.info("GPU-only mode: software video decoders disabled")
+
+
+_cpu_sample = (time.monotonic(), time.process_time())
+_cpu_percent = 0.0
+
+
+def process_cpu_percent() -> float:
+    """CPU used by this whole app recently, as % of one core (100% = one full core)."""
+    global _cpu_sample, _cpu_percent
+    now = (time.monotonic(), time.process_time())
+    wall = now[0] - _cpu_sample[0]
+    if wall >= 1.0:  # several tiles ask each interval; measure once
+        _cpu_percent = 100.0 * (now[1] - _cpu_sample[1]) / wall
+        _cpu_sample = now
+    return _cpu_percent
+
 
 # Hold at most two decoded frames. If drawing falls behind, older frames are
 # thrown away instead of piling up, so the picture never lags behind live.
@@ -96,7 +133,22 @@ def _have(*names: str) -> bool:
     return all(Gst.ElementFactory.find(n) is not None for n in names)
 
 
+def _on_wayland() -> bool:
+    display = Gdk.Display.get_default()
+    return display is not None and display.__gtype__.name == "GdkWaylandDisplay"
+
+
 def _build_sink(kind: str) -> VideoSink | None:
+    if kind == "wayland":
+        if not _have("gtkwaylandsink") or not _on_wayland():
+            return None
+        # The compositor converts and scales on the GPU. videoconvert only kicks in
+        # (on the CPU) if the compositor can't take the decoder's pixel format,
+        # so it's left out in GPU-only mode.
+        convert = "" if GPU_ONLY else "videoconvert n-threads=0 ! "
+        desc = f"{LEAKY_QUEUE} ! {convert}gtkwaylandsink name=videosink"
+        return VideoSink(kind, Gst.parse_bin_from_description(desc, True))
+
     if kind == "gl":
         if not _have("gtkglsink", "glsinkbin"):
             return None
@@ -136,9 +188,15 @@ def _build_sink(kind: str) -> VideoSink | None:
     return VideoSink(kind, Gst.parse_bin_from_description(desc, True), prefix)
 
 
+class NoVideoOutput(RuntimeError):
+    pass
+
+
 def make_video_sink() -> VideoSink:
     kinds = SINK_ORDER if SINK_MODE not in SINK_ORDER else (SINK_MODE, "cpu")
     for kind in kinds:
+        if GPU_ONLY and kind in CPU_KINDS:
+            continue
         if kind in _failed_kinds and kind != "cpu":
             continue
         try:
@@ -148,7 +206,9 @@ def make_video_sink() -> VideoSink:
             sink = None
         if sink is not None:
             return sink
-    raise RuntimeError("No usable video output found")
+    raise NoVideoOutput(
+        "No GPU video output works here" if GPU_ONLY else "No usable video output found"
+    )
 
 
 class CameraTile(Gtk.EventBox):
@@ -168,19 +228,19 @@ class CameraTile(Gtk.EventBox):
         # Let the event box receive clicks on top of the video widget.
         self.set_above_child(True)
 
-        self._overlay = Gtk.Overlay()
-        self._overlay.get_style_context().add_class("camera-bg")
-        self.add(self._overlay)
+        # Caption bar above the video rather than drawn over it: the Wayland
+        # output is a compositor layer on top of the window and would hide it.
+        self._box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._box.get_style_context().add_class("camera-bg")
+        self.add(self._box)
         self._sink: VideoSink | None = None
         self._last_buffer: Gst.Buffer | None = None
         self._last_counters = (0, 0)
         self._resize_pending = False
 
-        self._label = Gtk.Label(xalign=0)
-        self._label.set_halign(Gtk.Align.START)
-        self._label.set_valign(Gtk.Align.START)
+        self._label = Gtk.Label(xalign=0, ellipsize=3)  # Pango.EllipsizeMode.END
         self._label.get_style_context().add_class("camera-label")
-        self._overlay.add_overlay(self._label)
+        self._box.pack_start(self._label, False, False, 0)
 
         self._playbin = Gst.ElementFactory.make("playbin", None)
         if self._playbin is None:
@@ -247,7 +307,7 @@ class CameraTile(Gtk.EventBox):
         self._playbin.set_property("uri", uri)
         self._set_status("Connecting…")
         if self._playbin.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-            if self._sink.kind != "cpu":
+            if self._sink.kind != "cpu" or GPU_ONLY:
                 # A synchronous failure here is almost always the GPU output
                 # being unusable on this system (e.g. no GL context).
                 self._fall_back()
@@ -309,13 +369,13 @@ class CameraTile(Gtk.EventBox):
     def _install_sink(self, sink: VideoSink) -> None:
         """Attach a video sink to playbin and show its widget. Playbin must be in NULL."""
         if self._sink is not None:
-            self._overlay.remove(self._sink.widget)
+            self._box.remove(self._sink.widget)
         self._sink = sink
         self._last_buffer = None
         self._last_counters = (0, 0)
         self._playbin.set_property("video-sink", sink.element)
         sink.element.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_buffer)
-        self._overlay.add(sink.widget)
+        self._box.pack_start(sink.widget, True, True, 0)
         sink.widget.connect("size-allocate", self._on_video_resized)
         sink.widget.show()
         self._update_scale()
@@ -387,13 +447,16 @@ class CameraTile(Gtk.EventBox):
         if msg.type == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
             log.warning("[%s] error: %s (%s)", self.camera.name, err.message, debug)
-            if self._sink.kind != "cpu" and (
+            if (self._sink.kind != "cpu" or GPU_ONLY) and (
                 self._sink.contains(msg.src)
                 or (not self._got_frame and "not-negotiated" in (debug or ""))
             ):
                 self._fall_back()
                 return
-            self._schedule_reconnect(err.message)
+            reason = err.message
+            if GPU_ONLY and err.matches(Gst.CoreError.quark(), Gst.CoreError.MISSING_PLUGIN):
+                reason = "No GPU decoder for this stream (GPU-only mode)"
+            self._schedule_reconnect(reason)
         elif msg.type == Gst.MessageType.EOS:
             log.info("[%s] end of stream", self.camera.name)
             self._schedule_reconnect("Stream ended")
@@ -402,7 +465,16 @@ class CameraTile(Gtk.EventBox):
         failed = self._sink.kind
         _failed_kinds.add(failed)
         self._playbin.set_state(Gst.State.NULL)
-        self._install_sink(make_video_sink())
+        try:
+            sink = make_video_sink()
+        except NoVideoOutput as exc:
+            log.error("%s video output failed and no other is allowed: %s", failed, exc)
+            self._wanted = False
+            self._cancel_retry()
+            hint = " (turn off “GPU only” in the menu)" if GPU_ONLY else ""
+            self._set_status(f"{exc}{hint}")
+            return
+        self._install_sink(sink)
         log.warning("%s video output failed; switching to %s", failed, self._sink.kind)
         if self._wanted:
             self.start()
@@ -413,11 +485,12 @@ class CameraTile(Gtk.EventBox):
             prev_r, prev_d = self._last_counters
             if rendered >= prev_r:
                 log.debug(
-                    "[%s] %.1f fps shown, %d dropped (%s output)",
+                    "[%s] %.1f fps shown, %d dropped (%s output), app CPU %.0f%%",
                     self.camera.name,
                     (rendered - prev_r) / WATCHDOG_INTERVAL_S,
                     dropped - prev_d,
                     self._sink.kind,
+                    process_cpu_percent(),
                 )
             self._last_counters = (rendered, dropped)
         if (

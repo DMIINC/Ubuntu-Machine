@@ -77,7 +77,8 @@ Cameras are stored in `~/.config/reolink-viewer/config.json`. The file is create
 - **Choppy video**: run `reolink-viewer -v` from a terminal. Every 5 seconds each camera logs `NN fps shown, N dropped (gl|sw output)` and names its decoder, which tells you whether the network, decoding or display is the bottleneck. Things to try:
   - Switch **Protocol** to **HTTP-FLV** (port 80). Reolink's RTSP implementation is often the weakest option.
   - In the Reolink app, set the camera's Clear stream to a fixed frame rate (20–25), and consider a 4 Mbps+ bitrate over a wired connection.
-  - The app picks the fastest working video output automatically: OpenGL (`gl`), then NVIDIA CUDA scaling (`cuda`), then multithreaded CPU scaling (`cpu`). Frames are scaled down to the on-screen size before drawing, and stale frames are dropped rather than queued, so the picture stays live. To force one output, run e.g. `REOLINK_VIEWER_SINK=cpu reolink-viewer`.
+  - The app picks the fastest working video output automatically: on Wayland the compositor draws the video directly (`wayland`), then OpenGL (`gl`), NVIDIA CUDA scaling (`cuda`) and multithreaded CPU scaling (`cpu`). Stale frames are dropped rather than queued, so the picture stays live. To force one output, run e.g. `REOLINK_VIEWER_SINK=gl reolink-viewer`.
+  - **GPU only** (menu, on by default): software video decoders and the CPU drawing paths are never used. If your GPU can't decode a stream, the tile says so instead of falling back to the CPU. Turn it off in the menu if you want CPU fallback.
 - **High CPU with many main streams**: keep the grid on sub streams (the default). Hardware decoding needs working VA-API drivers (`sudo apt install vainfo && vainfo`).
 - For detailed logs, run `reolink-viewer -v` from a terminal. For GStreamer-level logs, add `GST_DEBUG=3`.
 

@@ -40,8 +40,15 @@ for line in "${CAMS[@]}"; do
     done
 done
 
+APP_FILTER="fps shown|decoder|output|error|WARNING|GPU-only"
 echo; echo "=== App run (25s, window will open)"
-timeout 25 "$HERE/reolink-viewer" -v 2>&1 | grep -E "fps shown|decoder|output|error|WARNING" | tail -30 | mask
+timeout 25 "$HERE/reolink-viewer" -v 2>&1 | grep -E "$APP_FILTER" | tail -30 | mask
+
+if [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
+    echo; echo "=== App run through X11 compatibility mode, GPU/OpenGL output (20s)"
+    GDK_BACKEND=x11 REOLINK_VIEWER_SINK=gl timeout 20 "$HERE/reolink-viewer" -v 2>&1 \
+        | grep -E "$APP_FILTER" | tail -20 | mask
+fi
 } 2>&1 | tee "$OUT"
 
 echo; echo "Saved to $OUT - paste its contents back to Claude."

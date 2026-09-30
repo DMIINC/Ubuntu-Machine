@@ -139,6 +139,7 @@ def redact_url(url: str) -> str:
 class Settings:
     columns: int = 0  # 0 = automatic
     hd_when_maximized: bool = True
+    gpu_only: bool = True
     cameras: list[Camera] = field(default_factory=list)
 
     @classmethod
@@ -146,6 +147,7 @@ class Settings:
         return cls(
             columns=int(data.get("columns", 0)),
             hd_when_maximized=bool(data.get("hd_when_maximized", True)),
+            gpu_only=bool(data.get("gpu_only", True)),
             cameras=[Camera.from_dict(c) for c in data.get("cameras", [])],
         )
 
@@ -153,6 +155,7 @@ class Settings:
         return {
             "columns": self.columns,
             "hd_when_maximized": self.hd_when_maximized,
+            "gpu_only": self.gpu_only,
             "cameras": [c.to_dict() for c in self.cameras],
         }
 
