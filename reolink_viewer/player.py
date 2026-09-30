@@ -73,7 +73,8 @@ def process_cpu_percent() -> float:
 
 # Decoded frames wait here for the pacer. If drawing or pacing ever falls far
 # behind, the oldest frames are thrown away instead of piling up.
-LEAKY_QUEUE = "queue name=q max-size-buffers=25 max-size-bytes=0 max-size-time=0 leaky=downstream"
+# Room for the pacer's largest cushion (0.8 s) plus a full burst on top at 30 fps.
+LEAKY_QUEUE = "queue name=q max-size-buffers=50 max-size-bytes=0 max-size-time=0 leaky=downstream"
 # REOLINK_VIEWER_SYNC=0 disables pacing: frames show the instant they're decoded.
 PACED = os.environ.get("REOLINK_VIEWER_SYNC", "1") != "0"
 
@@ -186,11 +187,11 @@ class VideoSink:
     def _on_overrun(self, _queue) -> None:
         self.queue_drops += 1
 
-    def counters(self) -> tuple[int, int]:
-        """(rendered, dropped) frame totals since the sink started."""
+    def counters(self) -> tuple[int, int, int, int]:
+        """Totals since start: (rendered, queue overflow, too late, sink dropped)."""
         stats = self.sink.get_property("stats")
-        pacer_drops = self.pacer.dropped if self.pacer else 0
-        return stats.get_value("rendered"), stats.get_value("dropped") + self.queue_drops + pacer_drops
+        late = self.pacer.dropped if self.pacer else 0
+        return stats.get_value("rendered"), self.queue_drops, late, stats.get_value("dropped")
 
     def set_target_width(self, width: int) -> None:
         """Scale frames to this width before drawing (no-op for the GL path)."""
@@ -320,7 +321,7 @@ class CameraTile(Gtk.EventBox):
         self.add(self._box)
         self._sink: VideoSink | None = None
         self._last_buffer: Gst.Buffer | None = None
-        self._last_counters = (0, 0)
+        self._last_counters: tuple = ()
         self._resize_pending = False
 
         self._label = Gtk.Label(xalign=0, ellipsize=3)  # Pango.EllipsizeMode.END
@@ -464,7 +465,7 @@ class CameraTile(Gtk.EventBox):
             self._box.remove(self._sink.widget)
         self._sink = sink
         self._last_buffer = None
-        self._last_counters = (0, 0)
+        self._last_counters: tuple = ()
         self._playbin.set_property("video-sink", sink.element)
         sink.element.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_buffer)
         self._box.pack_start(sink.widget, True, True, 0)
@@ -481,6 +482,21 @@ class CameraTile(Gtk.EventBox):
             # don't need that, so hand each frame out as soon as it's decoded.
             if element.find_property("max-display-delay") is not None:
                 element.set_property("max-display-delay", 0)
+            if "Video" in factory.get_metadata("klass"):
+                element.get_static_pad("src").connect("notify::caps", self._on_decoder_caps)
+
+    def _on_decoder_caps(self, pad, _pspec) -> None:
+        caps = pad.get_current_caps()
+        if caps is None or not caps.get_size():
+            return
+        features = caps.get_features(0).to_string()
+        where = "system RAM (copied to GPU for display)" if features in ("", "memory:SystemMemory") else features
+        st = caps.get_structure(0)
+        log.info(
+            "[%s] decoded video: %dx%d %s in %s",
+            self.camera.name, st.get_int("width")[1], st.get_int("height")[1],
+            st.get_string("format"), where,
+        )
 
     def _on_video_resized(self, *_):
         # Coalesce the burst of allocations during a window resize.
@@ -573,19 +589,21 @@ class CameraTile(Gtk.EventBox):
 
     def _watchdog(self) -> bool:
         if self._wanted and self._got_frame and log.isEnabledFor(logging.DEBUG):
-            rendered, dropped = self._sink.counters()
-            prev_r, prev_d = self._last_counters
-            if rendered >= prev_r:
+            now = self._sink.counters()
+            prev = self._last_counters
+            if len(prev) == len(now) and now[0] >= prev[0]:
+                shown, overflow, late, sink = (a - b for a, b in zip(now, prev))
                 log.debug(
-                    "[%s] %.1f fps shown, %d dropped (%s output), smoothing buffer %s, app CPU %.0f%%",
+                    "[%s] %.1f fps shown, dropped: %d overflow / %d late / %d display "
+                    "(%s output), smoothing buffer %s, app CPU %.0f%%",
                     self.camera.name,
-                    (rendered - prev_r) / WATCHDOG_INTERVAL_S,
-                    dropped - prev_d,
+                    shown / WATCHDOG_INTERVAL_S,
+                    overflow, late, sink,
                     self._sink.kind,
                     f"{self._sink.pacer.cushion:.2f}s" if self._sink.pacer else "off",
                     process_cpu_percent(),
                 )
-            self._last_counters = (rendered, dropped)
+            self._last_counters = now
         if (
             self._wanted
             and not self._retry_id
