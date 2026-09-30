@@ -25,6 +25,7 @@ GTK 3 + GStreamer live viewer for Reolink cameras on Ubuntu (Python, apt package
 - The user wants all video work on the GPU (GPU-only mode is the default)
 
 ## Open items
-- Confirm the decoder outputs GL/CUDA memory rather than system RAM (look for the `decoded video: ... in ...` log line). App CPU is 20-34% of one core
+- Confirmed: default launch (XWayland, `gl` output) decodes into `memory:GLMemory`, 0 overflow drops after the 50-frame queue. Native Wayland output (`GDK_BACKEND=wayland`) decodes into system RAM. The Claude desktop app's shell exports `GDK_BACKEND=wayland`, so run the app with `env -u GDK_BACKEND` there. App CPU is 20-38% of one core, with one spike to 63%
+- Residual: 0-6 "late" pacer drops per 5 s (bursts beyond cushion + 0.5 s)
 - A smaller pacer cushion would need a less bursty source; HTTP-FLV (`protocol: flv`) is untested on this camera
-- The decode-only test in `diagnose.sh` often reads ~15.7 fps while the app shows ~25 fps. Not yet explained
+- Solved: the decode-only test in `diagnose.sh` read ~15.7 fps because `rtspsrc ! decodebin` linked the camera's AAC audio pad (16 kHz / 1024 samples = 15.6 packets/s). The test now filters to video and prints the decoder and size: main 3840x2160 `nvh265dec` ~25 fps, sub 640x360 `nvh264dec` ~15 fps, 0 dropped
