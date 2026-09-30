@@ -72,7 +72,15 @@ def process_cpu_percent() -> float:
 
 # Hold at most two decoded frames. If drawing falls behind, older frames are
 # thrown away instead of piling up, so the picture never lags behind live.
-LEAKY_QUEUE = "queue name=q max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream"
+# Frames are paced by their camera timestamps (after rtspsrc's jitter buffer has
+# smoothed them) so motion is even. The queue absorbs network bursts; if drawing
+# ever falls behind by more than ~0.4 s, the oldest frames are dropped instead of
+# the picture drifting further behind live.
+LEAKY_QUEUE = (
+    "queue name=q max-size-buffers=10 max-size-bytes=0 max-size-time=400000000 leaky=downstream"
+)
+# REOLINK_VIEWER_SYNC=0 shows frames the instant they're decoded (lowest latency, uneven motion).
+PACED = os.environ.get("REOLINK_VIEWER_SYNC", "1") != "0"
 
 
 class VideoSink:
@@ -88,9 +96,13 @@ class VideoSink:
         # glsinkbin wraps the real sink; its widget and stats live on the gtkglsink.
         self.sink = gtk_sink or inner
         self.widget: Gtk.Widget = self.sink.props.widget
-        # Live view: show each frame as soon as it's decoded instead of waiting
-        # on (often jittery) camera timestamps.
-        inner.set_property("sync", False)
+        for el in {inner, self.sink}:
+            el.set_property("sync", PACED)
+        if PACED:
+            # Show late frames anyway rather than skipping them; skipping is what
+            # makes a clock/counter in the picture visibly jump.
+            self.sink.set_property("max-lateness", -1)
+            self.sink.set_property("qos", False)
         self.widget.set_hexpand(True)
         self.widget.set_vexpand(True)
         self.queue_drops = 0
