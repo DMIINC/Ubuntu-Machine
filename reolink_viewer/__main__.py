@@ -1,6 +1,6 @@
-from reolink_viewer.display import choose_gdk_backend
+from reolink_viewer.display import prepare_display
 
-choose_gdk_backend()  # before Gtk is imported
+prepare_display()  # before Gtk and GStreamer are initialised
 
 from reolink_viewer.app import main  # noqa: E402
 

@@ -49,8 +49,7 @@ done
 
 APP_FILTER="fps shown|decoder|decoded video|output|error|WARNING|GPU-only"
 echo; echo "=== App run (40s, window will open)"
-# Match the desktop launcher: terminals inside some apps export GDK_BACKEND=wayland,
-# which the viewer honours as an explicit choice and so skips the XWayland/GL path.
+# Match the desktop launcher: terminals inside some apps export GDK_BACKEND.
 env -u GDK_BACKEND timeout 40 "$HERE/reolink-viewer" -v 2>&1 | grep -E "$APP_FILTER" | tail -30 | mask
 } 2>&1 | tee "$OUT"
 

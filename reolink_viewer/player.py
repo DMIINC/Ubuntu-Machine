@@ -27,13 +27,15 @@ WATCHDOG_INTERVAL_S = 5
 
 
 # Video output paths, best first. Each one that fails is skipped from then on:
-#   wayland - gtkwaylandsink: frames go straight to the compositor as a subsurface,
-#             which converts and scales them on the GPU (Wayland sessions only)
-#   gl   - gtkglsink: GPU scales and draws (Intel/AMD, X11)
+#   gl      - gtkglsink: GPU converts, scales and draws; decoders hand it frames in
+#             GPU memory (on Wayland this needs GST_GL_API=opengl3, see display.py)
+#   wayland - gtkwaylandsink: frames go to the compositor as a subsurface, which
+#             converts and scales them on the GPU (Wayland sessions only). Frames
+#             reach it in system RAM, and it stalls if a frame callback goes missing.
 #   cuda - NVIDIA GPU converts + scales to the window size, gtksink draws the result
 #   cpu  - multithreaded convert + scale to the window size, gtksink draws
-# REOLINK_VIEWER_SINK=gl|cuda|cpu forces a path ("sw" is an alias for cpu).
-SINK_ORDER = ("wayland", "gl", "cuda", "cpu")
+# REOLINK_VIEWER_SINK=wayland|gl|cuda|cpu forces a path ("sw" is an alias for cpu).
+SINK_ORDER = ("gl", "wayland", "cuda", "cpu")
 SINK_MODE = os.environ.get("REOLINK_VIEWER_SINK", "auto").lower().replace("sw", "cpu")
 _failed_kinds: set[str] = set()
 
@@ -41,6 +43,7 @@ _failed_kinds: set[str] = set()
 # drawing paths are never used. Set by the app from its settings.
 GPU_ONLY = False
 CPU_KINDS = ("cuda", "cpu")  # both paint the final frame with the CPU (cairo)
+GPU_KINDS = ("gl", "wayland")  # both are tied to the widget's window surface
 
 
 def configure(gpu_only: bool) -> None:
@@ -320,6 +323,7 @@ class CameraTile(Gtk.EventBox):
         self._box.get_style_context().add_class("camera-bg")
         self.add(self._box)
         self._sink: VideoSink | None = None
+        self._sink_stale = False
         self._last_buffer: Gst.Buffer | None = None
         self._last_counters: tuple = ()
         self._resize_pending = False
@@ -328,19 +332,8 @@ class CameraTile(Gtk.EventBox):
         self._label.get_style_context().add_class("camera-label")
         self._box.pack_start(self._label, False, False, 0)
 
-        self._playbin = Gst.ElementFactory.make("playbin", None)
-        if self._playbin is None:
-            raise RuntimeError(
-                "GStreamer 'playbin' not found. Install gstreamer1.0-plugins-base."
-            )
-        self._playbin.connect("source-setup", self._on_source_setup)
-        self._playbin.connect("deep-element-added", self._on_element_added)
-        self._install_sink(make_video_sink())
-        self._apply_audio_flag()
-
-        bus = self._playbin.get_bus()
-        bus.add_signal_watch()
-        self._bus_handler = bus.connect("message", self._on_bus_message)
+        self._playbin: Gst.Element | None = None
+        self._new_pipeline(make_video_sink())
 
         self._watchdog_id = GLib.timeout_add_seconds(WATCHDOG_INTERVAL_S, self._watchdog)
         self.connect("destroy", lambda *_: self.dispose())
@@ -390,6 +383,8 @@ class CameraTile(Gtk.EventBox):
             return
         log.info("[%s] connecting to %s", self.camera.name, self.camera.display_url(self.active_stream))
         self._stop_pipeline()
+        if self._sink_stale and not self._replace_stale_sink():
+            return
         self._playbin.set_property("uri", uri)
         self._set_status("Connecting…")
         if self._playbin.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -443,14 +438,41 @@ class CameraTile(Gtk.EventBox):
         self._wanted = False
         self._cancel_retry()
         if self._playbin is not None:
-            self._stop_pipeline()
+            self._release_playbin()
             self._last_buffer = None
-            bus = self._playbin.get_bus()
-            bus.disconnect(self._bus_handler)
-            bus.remove_signal_watch()
-            self._playbin = None
 
     # ----------------------------------------------------------------- internal
+
+    def _new_pipeline(self, sink: VideoSink) -> None:
+        """(Re)build the playbin around a video output.
+
+        A changed output always gets a fresh playbin: the old one caches the
+        previous GL output's display and context, and a new GL output (which
+        brings its own) can't use frames decoded against them.
+        """
+        self._release_playbin()
+        playbin = Gst.ElementFactory.make("playbin", None)
+        if playbin is None:
+            raise RuntimeError(
+                "GStreamer 'playbin' not found. Install gstreamer1.0-plugins-base."
+            )
+        playbin.connect("source-setup", self._on_source_setup)
+        playbin.connect("deep-element-added", self._on_element_added)
+        self._playbin = playbin
+        self._install_sink(sink)
+        self._apply_audio_flag()
+        bus = playbin.get_bus()
+        bus.add_signal_watch()
+        self._bus_handler = bus.connect("message", self._on_bus_message)
+
+    def _release_playbin(self) -> None:
+        if self._playbin is None:
+            return
+        self._stop_pipeline()
+        bus = self._playbin.get_bus()
+        bus.disconnect(self._bus_handler)
+        bus.remove_signal_watch()
+        self._playbin = None
 
     def _stop_pipeline(self) -> None:
         if self._sink is not None and self._sink.pacer is not None:
@@ -460,7 +482,7 @@ class CameraTile(Gtk.EventBox):
             self._sink.pacer.reset()
 
     def _install_sink(self, sink: VideoSink) -> None:
-        """Attach a video sink to playbin and show its widget. Playbin must be in NULL."""
+        """Attach a video sink to a new playbin and show its widget."""
         if self._sink is not None:
             self._box.remove(self._sink.widget)
         self._sink = sink
@@ -470,9 +492,41 @@ class CameraTile(Gtk.EventBox):
         sink.element.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_buffer)
         self._box.pack_start(sink.widget, True, True, 0)
         sink.widget.connect("size-allocate", self._on_video_resized)
+        if sink.kind in GPU_KINDS:
+            sink.widget.connect("unrealize", self._on_video_unrealized)
+            sink.widget.connect("realize", self._on_video_realized)
         sink.widget.show()
+        self._sink_stale = False  # removing the old widget above may have flagged it
         self._update_scale()
         log.debug("[%s] using %s video output", self.camera.name, sink.kind)
+
+    def _on_video_unrealized(self, widget) -> None:
+        # The GPU outputs stay bound to the surface they first drew on (gl: the GL
+        # context of the old widget window, wayland: a subsurface of it). Once the
+        # widget is re-created, e.g. after moving to another grid cell, frames still
+        # flow but nothing reaches the screen, so the output must be replaced.
+        if self._sink is not None and widget is self._sink.widget:
+            self._sink_stale = True
+
+    def _on_video_realized(self, _widget) -> None:
+        if self._sink_stale and self._wanted:
+            GLib.idle_add(self._restart_if_stale)
+
+    def _restart_if_stale(self) -> bool:
+        if self._sink_stale and self._wanted:
+            log.info("[%s] video surface was re-created, restarting with a new output", self.camera.name)
+            self.restart()
+        return False
+
+    def _replace_stale_sink(self) -> bool:
+        """Swap in a new video output and pipeline. False if no output is usable."""
+        try:
+            self._new_pipeline(make_video_sink())
+        except NoVideoOutput as exc:
+            self._wanted = False
+            self._set_status(str(exc))
+            return False
+        return True
 
     def _on_element_added(self, _bin, _sub, element) -> None:
         factory = element.get_factory()
@@ -582,7 +636,7 @@ class CameraTile(Gtk.EventBox):
             hint = " (turn off “GPU only” in the menu)" if GPU_ONLY else ""
             self._set_status(f"{exc}{hint}")
             return
-        self._install_sink(sink)
+        self._new_pipeline(sink)
         log.warning("%s video output failed; switching to %s", failed, self._sink.kind)
         if self._wanted:
             self.start()

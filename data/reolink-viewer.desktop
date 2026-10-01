@@ -8,3 +8,4 @@ Terminal=false
 Categories=AudioVideo;Video;Player;
 Keywords=reolink;camera;cctv;rtsp;security;
 StartupNotify=true
+StartupWMClass=com.dmiinc.ReolinkViewer

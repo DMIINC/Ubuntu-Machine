@@ -109,17 +109,32 @@ class MainWindow(Gtk.ApplicationWindow):
         return [self.tiles[c.id] for c in self.settings.cameras if c.id in self.tiles]
 
     def relayout(self) -> None:
+        tiles = self.ordered_tiles()
         for child in self.grid.get_children():
-            self.grid.remove(child)
-        tiles = [self.focused] if self.focused else self.ordered_tiles()
+            if child not in tiles:
+                self.grid.remove(child)
         if not tiles:
             self.stack.set_visible_child_name("empty")
             return
         cols = self.settings.columns or math.ceil(math.sqrt(len(tiles)))
         cols = max(1, min(cols, len(tiles)))
+        # Tiles are only re-attached when their cell changes: re-attaching re-creates
+        # the video widget's window, and the tile then has to rebuild its output.
         for i, tile in enumerate(tiles):
-            self.grid.attach(tile, i % cols, i // cols, 1, 1)
-            tile.show_all()
+            cell = (i % cols, i // cols)
+            if tile.get_parent() is self.grid:
+                if cell == (self.grid.child_get_property(tile, "left-attach"),
+                            self.grid.child_get_property(tile, "top-attach")):
+                    continue
+                self.grid.remove(tile)
+            self.grid.attach(tile, *cell, 1, 1)
+        # A maximized tile fills the grid because the hidden ones leave their
+        # rows and columns empty, and empty grid lines take no space.
+        for tile in tiles:
+            if self.focused is None or tile is self.focused:
+                tile.show_all()
+            else:
+                tile.hide()
         self.stack.set_visible_child_name("grid")
 
     def maximize(self, tile: CameraTile) -> None:
@@ -388,7 +403,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
 class ViewerApp(Gtk.Application):
     def __init__(self, config_path: Path, extra_urls: list[str]):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
+        # Launching again brings back the open window instead of opening a second
+        # one; ad-hoc URL playback still gets its own window.
+        flags = Gio.ApplicationFlags.NON_UNIQUE if extra_urls else Gio.ApplicationFlags.FLAGS_NONE
+        super().__init__(application_id=APP_ID, flags=flags)
         self.config_path = config_path
         self.settings: Settings = Settings()
         self.persist = not extra_urls
@@ -442,6 +460,10 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # The window's Wayland app id / X11 WM_CLASS; GNOME matches it to the
+    # launcher's StartupWMClass. Otherwise it's "__main__.py".
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name(APP_NAME)
     Gst.init(None)
     app = ViewerApp(args.config, args.urls)
     return app.run([sys.argv[0]])
