@@ -18,6 +18,7 @@ from gi.repository import Gdk, Gio, GLib, Gst, Gtk  # noqa: E402
 
 from . import APP_ID, APP_NAME, __version__  # noqa: E402
 from .config import (  # noqa: E402
+    GRID_STREAMS,
     Camera,
     Settings,
     default_config_path,
@@ -98,6 +99,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         for cam in self.settings.cameras:
             self._create_tile(cam)
+        self._apply_grid_stream()
         self.show_all()
         self.relayout()
         for tile in self.tiles.values():
@@ -137,15 +139,31 @@ class MainWindow(Gtk.ApplicationWindow):
                 tile.hide()
         self.stack.set_visible_child_name("grid")
 
+    def _grid_stream(self) -> str | None:
+        """Stream for tiles shown in the grid; None plays each camera's own setting."""
+        if self.settings.grid_stream and len(self.tiles) > 1:
+            return self.settings.grid_stream
+        return None
+
+    @staticmethod
+    def _set_stream(tile: CameraTile, stream: str | None) -> None:
+        if tile.camera.protocol != "custom":
+            tile.set_stream_override(stream)
+
+    def _apply_grid_stream(self) -> None:
+        stream = self._grid_stream()
+        for tile in self.tiles.values():
+            if tile is not self.focused:
+                self._set_stream(tile, stream)
+
     def maximize(self, tile: CameraTile) -> None:
         if self.focused is tile:
             return
         self.focused = tile
         for other in self.tiles.values():
             if other is not tile:
-                other.stop()  # save bandwidth/CPU while hidden
-        if self.settings.hd_when_maximized and tile.camera.protocol != "custom":
-            tile.set_stream_override("main")
+                other.stop()  # save bandwidth/CPU/GPU memory while hidden
+        self._set_stream(tile, "main" if self.settings.hd_when_maximized else None)
         if not tile.is_playing:
             tile.start()
         self.relayout()
@@ -153,8 +171,8 @@ class MainWindow(Gtk.ApplicationWindow):
     def restore(self) -> None:
         if not self.focused:
             return
-        self.focused.set_stream_override(None)
         self.focused = None
+        self._apply_grid_stream()
         self.relayout()
         for tile in self.tiles.values():
             if not tile.is_playing:
@@ -181,6 +199,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.settings.cameras.append(cam)
             self.app.save()
             tile = self._create_tile(cam)
+            self._apply_grid_stream()
             if self.focused:
                 self.restore()
             else:
@@ -215,6 +234,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.app.save()
         del self.tiles[tile.camera.id]
         tile.destroy()
+        self._apply_grid_stream()
         self.relayout()
 
     def move_camera(self, tile: CameraTile, delta: int) -> None:
@@ -267,6 +287,18 @@ class MainWindow(Gtk.ApplicationWindow):
         layout_item.set_submenu(layout_menu)
         menu.append(layout_item)
 
+        grid_item = Gtk.MenuItem(label="Grid stream")
+        grid_menu = Gtk.Menu()
+        group = None
+        for stream, label in GRID_STREAMS.items():
+            item = Gtk.RadioMenuItem(label=label, group=group)
+            group = item
+            item.set_active(self.settings.grid_stream == stream)
+            item.connect("toggled", self._on_grid_stream, stream)
+            grid_menu.append(item)
+        grid_item.set_submenu(grid_menu)
+        menu.append(grid_item)
+
         hd = Gtk.CheckMenuItem(label="Main stream when maximized", active=self.settings.hd_when_maximized)
         hd.connect("toggled", self._on_hd_toggled)
         menu.append(hd)
@@ -276,7 +308,7 @@ class MainWindow(Gtk.ApplicationWindow):
         menu.append(gpu)
 
         reconnect = Gtk.MenuItem(label="Reconnect all")
-        reconnect.connect("activate", lambda *_: [t.restart() for t in self.tiles.values() if t.is_playing])
+        reconnect.connect("activate", lambda *_: [t.reconnect() for t in self.tiles.values() if t.is_playing])
         menu.append(reconnect)
 
         snaps = Gtk.MenuItem(label="Open snapshots folder")
@@ -311,7 +343,7 @@ class MainWindow(Gtk.ApplicationWindow):
             other = "sub" if tile.active_stream == "main" else "main"
             item(f"Switch to {other} stream", lambda: tile.set_stream_override(other))
         item("Snapshot", lambda: self.take_snapshot(tile))
-        item("Reconnect", tile.restart)
+        item("Reconnect", tile.reconnect)
         menu.append(Gtk.SeparatorMenuItem())
         item("Move earlier", lambda: self.move_camera(tile, -1), self.focused is None)
         item("Move later", lambda: self.move_camera(tile, +1), self.focused is None)
@@ -351,6 +383,12 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_hd_toggled(self, item: Gtk.CheckMenuItem) -> None:
         self.settings.hd_when_maximized = item.get_active()
         self.app.save()
+
+    def _on_grid_stream(self, item: Gtk.RadioMenuItem, stream: str) -> None:
+        if item.get_active():
+            self.settings.grid_stream = stream
+            self.app.save()
+            self._apply_grid_stream()
 
     def _on_tile_click(self, tile: CameraTile, event: Gdk.EventButton) -> bool:
         if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:

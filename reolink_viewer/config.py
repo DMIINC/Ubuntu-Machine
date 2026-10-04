@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
@@ -23,7 +23,14 @@ DEFAULT_PORTS = {"rtsp": 554, "rtmp": 1935, "flv": 80, "custom": 0}
 STREAMS = {
     "main": "Main (high quality)",
     "sub": "Sub (low bandwidth)",
-    "ext": "Ext / balanced (RTMP & FLV only)",
+    "ext": "Balanced (over RTMP for RTSP cameras)",
+}
+# What the grid plays when several cameras share the screen ("" = each camera's
+# own stream). A 4K main stream holds over 1 GB of GPU memory.
+GRID_STREAMS = {
+    "ext": "Balanced",
+    "sub": "Sub (lowest quality)",
+    "": "Each camera's own stream",
 }
 CODECS = {"h264": "H.264", "h265": "H.265 / HEVC"}
 
@@ -76,6 +83,24 @@ def _userinfo(cam: Camera) -> str:
     return info + "@"
 
 
+def rtmp_safe(cam: Camera) -> bool:
+    """Whether Reolink's RTMP / HTTP-FLV servers will accept the camera's login.
+
+    Those take the username and password in the URL query and reject ones that
+    need URL-encoding, which RTSP accepts. Every rejection counts toward the
+    camera's login lockout, and a locked-out camera refuses RTSP too.
+    """
+    return all(quote(text, safe="") == text for text in (cam.username, cam.password))
+
+
+def resolve_stream(cam: Camera, stream: str) -> str:
+    """The stream that can actually be played: RTSP cameras get the balanced
+    stream over RTMP, which needs an RTMP-safe login, so otherwise sub."""
+    if stream == "ext" and cam.protocol == "rtsp" and not rtmp_safe(cam):
+        return "sub"
+    return stream
+
+
 def build_url(cam: Camera, stream: str | None = None) -> str:
     """Return the playable URL for a camera.
 
@@ -84,6 +109,9 @@ def build_url(cam: Camera, stream: str | None = None) -> str:
     HTTP-FLV: http://host:80/flv?port=1935&app=bcs&stream=channel0_main.bcs&user=..&password=..
     """
     stream = stream or cam.stream
+    if cam.protocol == "rtsp" and stream == "ext":
+        # Reolink's RTSP server has no balanced stream, but its RTMP server does.
+        cam = replace(cam, protocol="rtmp", port=DEFAULT_PORTS["rtmp"])
     proto = cam.protocol
 
     if proto == "custom":
@@ -139,6 +167,7 @@ def redact_url(url: str) -> str:
 class Settings:
     columns: int = 0  # 0 = automatic
     hd_when_maximized: bool = True
+    grid_stream: str = "ext"  # a GRID_STREAMS key
     gpu_only: bool = True
     cameras: list[Camera] = field(default_factory=list)
 
@@ -147,6 +176,7 @@ class Settings:
         return cls(
             columns=int(data.get("columns", 0)),
             hd_when_maximized=bool(data.get("hd_when_maximized", True)),
+            grid_stream=_grid_stream(data.get("grid_stream", "ext")),
             gpu_only=bool(data.get("gpu_only", True)),
             cameras=[Camera.from_dict(c) for c in data.get("cameras", [])],
         )
@@ -155,9 +185,14 @@ class Settings:
         return {
             "columns": self.columns,
             "hd_when_maximized": self.hd_when_maximized,
+            "grid_stream": self.grid_stream,
             "gpu_only": self.gpu_only,
             "cameras": [c.to_dict() for c in self.cameras],
         }
+
+
+def _grid_stream(value) -> str:
+    return value if value in GRID_STREAMS else "ext"
 
 
 def default_config_path() -> Path:

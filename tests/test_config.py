@@ -7,6 +7,7 @@ from reolink_viewer.config import (
     build_url,
     load_settings,
     redact_url,
+    resolve_stream,
     save_settings,
 )
 
@@ -21,9 +22,20 @@ def test_rtsp_url_main_h265_nvr_channel():
     assert build_url(cam, "main") == "rtsp://admin:p@10.0.0.9:554/h265Preview_03_main"
 
 
-def test_rtsp_ext_falls_back_to_sub():
-    cam = Camera(name="x", host="h", stream="ext")
-    assert build_url(cam).endswith("/h264Preview_01_sub")
+def test_rtsp_camera_gets_balanced_stream_over_rtmp():
+    cam = Camera(name="x", host="h", password="pw123", stream="ext")
+    assert build_url(cam) == (
+        "rtmp://h:1935/bcs/channel0_ext.bcs?channel=0&stream=0&user=admin&password=pw123"
+    )
+
+
+def test_balanced_stream_needs_rtmp_safe_login():
+    # RTMP takes the login in the URL query and rejects anything needing escaping.
+    assert resolve_stream(Camera(name="x", password="Abc123"), "ext") == "ext"
+    assert resolve_stream(Camera(name="x", password="Abc!123"), "ext") == "sub"
+    assert resolve_stream(Camera(name="x", password="Abc!123"), "main") == "main"
+    # RTMP / FLV cameras were set up that way on purpose.
+    assert resolve_stream(Camera(name="x", password="Abc!123", protocol="rtmp"), "ext") == "ext"
 
 
 def test_password_special_chars_are_escaped():
@@ -75,6 +87,14 @@ def test_save_and_load_roundtrip(tmp_path):
     assert loaded.columns == 3
     assert loaded.cameras[0].password == "pw"
     assert loaded.cameras[0].id == settings.cameras[0].id
+
+
+def test_grid_stream_defaults_to_balanced_and_roundtrips(tmp_path):
+    assert Settings.from_dict({}).grid_stream == "ext"  # configs from before the setting
+    assert Settings.from_dict({"grid_stream": "bogus"}).grid_stream == "ext"
+    path = tmp_path / "config.json"
+    save_settings(Settings(grid_stream=""), path)
+    assert load_settings(path).grid_stream == ""
 
 
 def test_unknown_keys_ignored():

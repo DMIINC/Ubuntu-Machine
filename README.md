@@ -10,7 +10,8 @@ It's built with Python, GTK 3 and GStreamer, which are all native Ubuntu package
 - Shows several cameras at once in an automatic grid, or you can pick 1–5 columns
 - Supports **RTSP** (default), **RTMP**, **HTTP-FLV** or any custom stream URL
 - Supports H.264 and H.265 (HEVC) cameras, and NVR channels 1–64
-- The grid uses the low-bandwidth **sub** stream. Double-clicking a camera maximizes it and switches to the **main** (HD) stream. The other cameras pause to save bandwidth.
+- With more than one camera, the grid plays each camera's **balanced** stream (e.g. 896×512), whatever stream the camera is set to (menu: **Grid stream**). A 4K main stream holds over 1 GB of GPU memory, so a grid of them can run the graphics card out of memory. Double-clicking a camera maximizes it and switches to the **main** (4K/HD) stream. The other cameras pause to save bandwidth and GPU memory.
+- Reolink serves the balanced stream only over RTMP, so RTSP cameras fetch it over RTMP. Reolink's RTMP rejects passwords with symbols (RTSP accepts them), so a camera whose password isn't letters and digits only plays its **sub** stream in the grid instead. The viewer never tries RTMP with such a password, because failed logins count toward the camera's lockout.
 - Reconnects automatically with backoff when a camera drops, errors or stops sending video
 - Saves **snapshots** as PNG files to `~/Pictures/Reolink/`
 - Optional audio for each camera
@@ -35,7 +36,7 @@ To run it without installing (once the apt packages are present):
 
 ## Camera setup
 
-1. In the Reolink app or web UI, open **Settings → Network → Advanced → Server Settings** (the wording varies by model and firmware). Turn on **RTSP**, and turn on **RTMP/HTTP** too if you want those protocols.
+1. In the Reolink app or web UI, open **Settings → Network → Advanced → Server Settings** (the wording varies by model and firmware). Turn on **RTSP** and **RTMP** (RTMP carries the balanced stream the grid uses).
 2. In Reolink Viewer, click **+** and enter the camera's IP address, username (usually `admin`) and password.
 3. Leave the protocol set to RTSP and the port at 554. For cameras encoding H.265 (many 4K/8MP models), set **Codec** to **H.265**.
 4. For an **NVR** or Home Hub, use the NVR's IP address and add one entry per camera, with **Channel** set to 1, 2, 3…
@@ -81,7 +82,7 @@ Cameras are stored in `~/.config/reolink-viewer/config.json`. The file is create
   - The app runs natively on Wayland, including on NVIDIA (it sets `GST_GL_API=opengl3` so GStreamer's OpenGL output can share GTK's GL context). Running it through XWayland (`GDK_BACKEND=x11`) works, but with fractional scaling GNOME can draw the window shifted or too large, spilling over other windows.
   - Frames are paced evenly: many cameras (Reolink included) send frames in bursts with unreliable timestamps, so the app measures the real frame rate, keeps a small buffer that adapts to the camera's longest recent pause (0.1–0.8 s), and shows one frame per interval. `REOLINK_VIEWER_SYNC=0` shows frames as soon as they arrive instead: lower latency, uneven motion.
   - **GPU only** (menu, on by default): software video decoders and the CPU drawing paths are never used. If your GPU can't decode a stream, the tile says so instead of falling back to the CPU. Turn it off in the menu if you want CPU fallback.
-- **High CPU with many main streams**: keep the grid on sub streams (the default). Hardware decoding needs working VA-API drivers (`sudo apt install vainfo && vainfo`).
+- **High CPU or GPU memory with many main streams**: keep **Grid stream** on **Balanced** or **Sub**. If other apps crash or the desktop stutters while the viewer runs, check `nvidia-smi`: the GPU memory may be full. Hardware decoding needs working VA-API drivers (`sudo apt install vainfo && vainfo`).
 - For detailed logs, run `reolink-viewer -v` from a terminal. For GStreamer-level logs, add `GST_DEBUG=3`.
 
 ## Development

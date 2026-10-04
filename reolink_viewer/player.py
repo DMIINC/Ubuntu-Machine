@@ -15,7 +15,7 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import Gdk, GLib, Gst, GstVideo, Gtk  # noqa: E402
 
-from .config import Camera  # noqa: E402
+from .config import Camera, resolve_stream, rtmp_safe  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +72,26 @@ def process_cpu_percent() -> float:
         _cpu_percent = 100.0 * (now[1] - _cpu_sample[1]) / wall
         _cpu_sample = now
     return _cpu_percent
+
+
+# Every tile decodes with the same CUDA context. Otherwise each pipeline makes
+# its own, which costs ~120 MB of GPU memory per camera.
+CUDA_CONTEXT_TYPE = "gst.cuda.context"
+_cuda_context: Gst.Context | None = None
+
+
+def _share_cuda_context(_bus, msg: Gst.Message) -> None:
+    """Bus sync handler (runs on streaming threads): hand out the first CUDA context."""
+    global _cuda_context
+    if msg.type == Gst.MessageType.NEED_CONTEXT:
+        ok, kind = msg.parse_context_type()
+        if ok and kind == CUDA_CONTEXT_TYPE and _cuda_context is not None:
+            msg.src.set_context(_cuda_context)
+    elif msg.type == Gst.MessageType.HAVE_CONTEXT:
+        context = msg.parse_have_context()
+        if context.get_context_type() == CUDA_CONTEXT_TYPE and _cuda_context is None:
+            log.debug("sharing one CUDA context between cameras")
+            _cuda_context = context
 
 
 # Decoded frames wait here for the pacer. If drawing or pacing ever falls far
@@ -182,6 +202,10 @@ class VideoSink:
         self.widget.set_hexpand(True)
         self.widget.set_vexpand(True)
         self.queue_drops = 0
+        # This handler also makes a reference cycle (queue -> handler -> self -> bin)
+        # that keeps a replaced output alive, which is required: freeing a gtkglsink
+        # on Wayland terminates the EGL display GTK shares, and every GL draw after
+        # that fails with "eglMakeCurrent failed".
         queue.connect("overrun", self._on_overrun)
         self._scale = bin_.get_by_name("scale")
         self._caps_prefix = caps_prefix
@@ -307,6 +331,9 @@ class CameraTile(Gtk.EventBox):
         super().__init__()
         self.camera = camera
         self.stream_override: str | None = None
+        # The balanced stream comes over RTMP, which a camera may have turned off.
+        self._ext_worked = False
+        self._ext_unavailable = False
         self._wanted = False
         self._retry_id = 0
         self._backoff = RETRY_MIN_S
@@ -342,8 +369,16 @@ class CameraTile(Gtk.EventBox):
     # ------------------------------------------------------------------ public
 
     @property
-    def active_stream(self) -> str:
+    def wanted_stream(self) -> str:
         return self.stream_override or self.camera.stream
+
+    @property
+    def active_stream(self) -> str:
+        """The stream actually played: sub stands in for an unavailable balanced one."""
+        stream = resolve_stream(self.camera, self.wanted_stream)
+        if stream == "ext" and self._ext_unavailable:
+            return "sub"
+        return stream
 
     @property
     def is_playing(self) -> bool:
@@ -352,6 +387,7 @@ class CameraTile(Gtk.EventBox):
     def set_camera(self, camera: Camera) -> None:
         """Replace the camera settings (after editing) and restart if running."""
         self.camera = camera
+        self._ext_worked = self._ext_unavailable = False
         self._apply_audio_flag()
         if self._wanted:
             self.restart()
@@ -381,6 +417,12 @@ class CameraTile(Gtk.EventBox):
         if not uri:
             self._set_status("No URL configured")
             return
+        if self.wanted_stream == "ext" and self.active_stream == "sub":
+            log.info(
+                "[%s] playing the sub stream: the balanced one needs RTMP%s", self.camera.name,
+                ", which rejects this login (use letters and digits only)"
+                if not rtmp_safe(self.camera) else ", which failed",
+            )
         log.info("[%s] connecting to %s", self.camera.name, self.camera.display_url(self.active_stream))
         self._stop_pipeline()
         if self._sink_stale and not self._replace_stale_sink():
@@ -404,6 +446,11 @@ class CameraTile(Gtk.EventBox):
     def restart(self) -> None:
         self._backoff = RETRY_MIN_S
         self.start()
+
+    def reconnect(self) -> None:
+        """Reconnect on request, trying the balanced stream again if it failed."""
+        self._ext_unavailable = False
+        self.restart()
 
     def snapshot_png(self) -> bytes | None:
         """Return the current frame as PNG bytes, or None if nothing is playing."""
@@ -464,6 +511,11 @@ class CameraTile(Gtk.EventBox):
         bus = playbin.get_bus()
         bus.add_signal_watch()
         self._bus_handler = bus.connect("message", self._on_bus_message)
+        bus.enable_sync_message_emission()
+        self._sync_handlers = [
+            bus.connect(f"sync-message::{kind}", _share_cuda_context)
+            for kind in ("need-context", "have-context")
+        ]
 
     def _release_playbin(self) -> None:
         if self._playbin is None:
@@ -472,6 +524,9 @@ class CameraTile(Gtk.EventBox):
         bus = self._playbin.get_bus()
         bus.disconnect(self._bus_handler)
         bus.remove_signal_watch()
+        for handler in self._sync_handlers:
+            bus.disconnect(handler)
+        bus.disable_sync_message_emission()
         self._playbin = None
 
     def _stop_pipeline(self) -> None:
@@ -602,6 +657,8 @@ class CameraTile(Gtk.EventBox):
         self._update_scale()  # source size is known now
         if self._wanted:
             self._backoff = RETRY_MIN_S
+            if self.active_stream == "ext":
+                self._ext_worked = True
             self._set_status("Live")
         return False
 
@@ -614,6 +671,11 @@ class CameraTile(Gtk.EventBox):
                 or (not self._got_frame and "not-negotiated" in (debug or ""))
             ):
                 self._fall_back()
+                return
+            if self.active_stream == "ext" and not self._ext_worked:
+                # e.g. RTMP turned off on the camera: show its sub stream instead.
+                self._ext_unavailable = True
+                self.restart()
                 return
             reason = err.message
             if GPU_ONLY and err.matches(Gst.CoreError.quark(), Gst.CoreError.MISSING_PLUGIN):
@@ -695,6 +757,7 @@ class CameraTile(Gtk.EventBox):
 
     def _update_label(self) -> None:
         stream = self.active_stream if self.camera.protocol != "custom" else "custom"
+        stream = "balanced" if stream == "ext" else stream
         text = f"{self.camera.name}  ·  {stream}  ·  {self._status}"
         self._label.set_text(text)
         try:
