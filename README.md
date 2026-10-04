@@ -12,7 +12,7 @@ It's built with Python, GTK 3 and GStreamer, which are all native Ubuntu package
 - Supports H.264 and H.265 (HEVC) cameras, and NVR channels 1–64
 - With more than one camera, the grid plays each camera's **balanced** stream (e.g. 896×512), whatever stream the camera is set to (menu: **Grid stream**). A 4K main stream holds over 1 GB of GPU memory, so a grid of them can run the graphics card out of memory. Double-clicking a camera maximizes it and switches to the **main** (4K/HD) stream. The other cameras pause to save bandwidth and GPU memory.
 - Reolink serves the balanced stream only over RTMP, so RTSP cameras fetch it over RTMP. Reolink's RTMP rejects passwords with symbols other than `- _ . ~ !` (RTSP accepts any), so a camera with another symbol in its password plays its **sub** stream in the grid instead. The viewer never tries RTMP with such a password, because failed logins count toward the camera's lockout. A camera with RTMP turned off also plays sub.
-- **Battery cameras** (Argus, battery Duo, …) through [neolink](https://github.com/QuantumEntangledAndy/neolink), which the viewer runs in the background. They sleep until you double-click their tile, go back to sleep when you return to the grid, and after 5 minutes at most. Reolink's servers aren't used: neolink finds the camera on your network by its UID.
+- **Battery cameras** (Argus, battery Duo, …) through [neolink](https://github.com/QuantumEntangledAndy/neolink), which the viewer runs only while one is being watched. They sleep until you double-click their tile, go back to sleep when you return to the grid, and after 5 minutes at most. A dual-lens camera shows both lenses side by side. Reolink's servers aren't used: neolink finds the camera on your network by its UID.
 - Reconnects automatically with backoff when a camera drops, errors or stops sending video
 - Saves **snapshots** as PNG files to `~/Pictures/Reolink/`
 - Optional audio for each camera
@@ -46,7 +46,9 @@ To run it without installing (once the apt packages are present):
 
 Battery cameras have no RTSP or RTMP server; the Reolink app wakes them over Reolink's own protocol. Set **Protocol** to **Battery camera (via neolink)**, then enter the camera's **UID** (Reolink app → camera → Settings → Device Info; mind `0` vs `O`), username and password. The grid plays the sub stream and a maximized camera the main stream; there is no balanced stream.
 
-The tile shows *Asleep* until you double-click it. Waking takes a few seconds; if the camera can't be reached within 45 s, the tile says so and stops trying. Each wake costs battery, so the camera sleeps again when you go back to the grid, and after 5 minutes. Right-click a tile for **Wake** / **Sleep now**.
+For a **dual-lens** camera (e.g. Reolink Duo), add it twice with the same UID: **Channel** 1 for the first lens and 2 for the second. Double-clicking either one shows both lenses side by side.
+
+The tile shows *Asleep* until you double-click it. Waking the Reolink Duo took 40–45 s to live video on both lenses (neolink is ready after ~15 s; its first connection often stalls and is retried). If the camera can't be reached within 45 s, the tile says so and stops trying. Each wake costs battery, so the camera sleeps again when you go back to the grid, and after 5 minutes. Right-click a tile for **Wake** / **Sleep now**.
 
 URLs the app generates:
 
@@ -104,5 +106,5 @@ Code layout:
 - `reolink_viewer/config.py`: camera model, URL building and saving/loading the config
 - `reolink_viewer/player.py`: `CameraTile`, a GStreamer `playbin` + `gtksink` widget with reconnect/watchdog
 - `reolink_viewer/dialogs.py`: the add/edit camera dialog
-- `reolink_viewer/neolink.py`: runs neolink for battery cameras and writes its config (in `$XDG_RUNTIME_DIR`, removed on exit)
+- `reolink_viewer/neolink.py`: runs neolink while battery cameras are watched, and writes its config (in `$XDG_RUNTIME_DIR`, removed when it stops)
 - `reolink_viewer/app.py`: main window, grid, menus and shortcuts

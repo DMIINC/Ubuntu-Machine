@@ -126,7 +126,7 @@ class CameraDialog(Gtk.Dialog):
             self.uid: battery,
             self.username: not custom,
             self.password.get_parent(): not custom,
-            self.channel: not (custom or battery),
+            self.channel: not custom,
             self.stream: not custom,
             self.codec: proto == "rtsp",
             self.custom_url: custom,
@@ -141,9 +141,13 @@ class CameraDialog(Gtk.Dialog):
         except ValueError:
             url = ""
         self.preview.set_text(url)
+        self.channel.set_tooltip_text(
+            "Lens: 2 for a dual-lens camera's second lens" if battery
+            else "Use 1 for a standalone camera; NVR / Home Hub channel otherwise")
         if battery:
             hint = ("neolink finds the camera on your network by UID (Reolink's servers "
-                    "aren't used). It sleeps until you double-click its tile.")
+                    "aren't used). It sleeps until you double-click its tile. A dual-lens "
+                    "camera (e.g. Reolink Duo) needs one entry per lens: Channel 1 and 2.")
         elif proto == "rtsp" and cam.password and not rtmp_safe(cam):
             hint = ("The grid will play this camera's sub stream: the balanced stream "
                     "comes over RTMP, which only accepts passwords whose symbols "

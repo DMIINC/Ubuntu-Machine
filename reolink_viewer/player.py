@@ -29,6 +29,7 @@ WATCHDOG_INTERVAL_S = 5
 # may stream before it goes back to sleep. Each minute awake costs battery.
 WAKE_TIMEOUT_S = 45
 AWAKE_LIMIT_S = 5 * 60
+NEOLINK_TIMEOUT_US = 10_000_000  # rtspsrc gives up on an unanswered request (default 20 s)
 ASLEEP = "Asleep · double-click to view"
 
 
@@ -338,11 +339,16 @@ class CameraTile(Gtk.EventBox):
     """
 
     def __init__(self, camera: Camera,
-                 before_start: Callable[[Camera], str | None] | None = None):
+                 wake: Callable[[Camera, str], str | None] | None = None,
+                 sleep: Callable[[Camera], None] | None = None,
+                 ready: Callable[[Camera], bool] | None = None):
         super().__init__()
         self.camera = camera
-        # Returns why the camera can't be played right now, or None.
-        self._before_start = before_start
+        # Battery cameras: wake(camera, stream) returns why it can't, or None;
+        # ready(camera) says whether its stream can be connected to yet.
+        self._wake = wake
+        self._sleep = sleep
+        self._ready = ready
         self.stream_override: str | None = None
         # The balanced stream comes over RTMP, which a camera may have turned off.
         self._ext_worked = False
@@ -438,10 +444,13 @@ class CameraTile(Gtk.EventBox):
         if not uri:
             self._set_status("No URL configured")
             return
-        if self._before_start:
-            problem = self._before_start(self.camera)
+        if self.camera.on_demand and self._wake:
+            problem = self._wake(self.camera, self.active_stream)
             if problem:
                 self.stop(problem)
+                return
+            if self._ready and not self._ready(self.camera):
+                self._wait_for_wake()
                 return
         if self.wanted_stream == "ext" and self.active_stream == "sub":
             log.info(
@@ -467,6 +476,8 @@ class CameraTile(Gtk.EventBox):
         self._wanted = False
         self._cancel_retry()
         self._stop_pipeline()
+        if self.camera.on_demand and self._sleep:
+            self._sleep(self.camera)
         self._set_status(status or self._idle_status())
 
     def restart(self) -> None:
@@ -667,6 +678,10 @@ class CameraTile(Gtk.EventBox):
             # Reolink RTSP over UDP drops lots of packets; TCP is far more reliable.
             source.set_property("latency", RTSP_LATENCY_MS)
             Gst.util_set_object_arg(source, "protocols", "tcp")
+            if self.camera.on_demand:
+                # neolink sometimes never answers a battery camera's first
+                # connection; a retry usually works within seconds.
+                source.set_property("tcp-timeout", NEOLINK_TIMEOUT_US)
         elif name in ("souphttpsrc",):
             source.set_property("is-live", True)
 
@@ -707,6 +722,12 @@ class CameraTile(Gtk.EventBox):
             reason = err.message
             if GPU_ONLY and err.matches(Gst.CoreError.quark(), Gst.CoreError.MISSING_PLUGIN):
                 reason = "No GPU decoder for this stream (GPU-only mode)"
+            elif (
+                self.camera.protocol == "rtsp"
+                and err.matches(Gst.ResourceError.quark(), Gst.ResourceError.OPEN_READ_WRITE)
+            ):
+                # rtspsrc's "Could not open resource for reading and writing."
+                reason = "Can't connect (offline? RTSP off? battery camera: Edit → Protocol)"
             self._schedule_reconnect(reason)
         elif msg.type == Gst.MessageType.EOS:
             log.info("[%s] end of stream", self.camera.name)
@@ -781,12 +802,25 @@ class CameraTile(Gtk.EventBox):
                 log.warning("[%s] didn't wake: %s", self.camera.name, reason)
                 self.stop("Camera didn't wake (UID, Wi-Fi?) · double-click to try again")
                 return
-            delay = RETRY_MIN_S
+            delay = 1
+            reason = "Waking camera…"
         else:
             delay = self._backoff
             self._backoff = min(self._backoff * 2, RETRY_MAX_S)
         self._set_status(f"{reason} — retrying in {delay}s")
         self._retry_id = GLib.timeout_add_seconds(delay, self._on_retry)
+
+    def _wait_for_wake(self) -> None:
+        """Check again shortly; connecting before neolink serves the stream jams it."""
+        self._stop_pipeline()
+        if not self._wake_deadline:
+            self._wake_deadline = time.monotonic() + WAKE_TIMEOUT_S
+        if time.monotonic() > self._wake_deadline:
+            log.warning("[%s] didn't wake within %ss", self.camera.name, WAKE_TIMEOUT_S)
+            self.stop("Camera didn't wake (UID, Wi-Fi?) · double-click to try again")
+            return
+        self._set_status("Waking camera…")
+        self._retry_id = GLib.timeout_add(500, self._on_retry)
 
     def _on_retry(self) -> bool:
         self._retry_id = 0

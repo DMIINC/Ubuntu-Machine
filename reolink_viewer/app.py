@@ -57,6 +57,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.settings = app.settings
         self.tiles: dict[str, CameraTile] = {}
         self.focused: CameraTile | None = None
+        self.shown: list[CameraTile] = []  # maximized: the focused tile, or all its lenses
         self.is_fullscreen = False
         self.set_default_size(1280, 760)
 
@@ -98,7 +99,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.connect("window-state-event", self._on_window_state)
         self.connect("delete-event", self._on_delete)
 
-        # Serves the battery cameras; started now so a first wake is quick.
+        # Wakes and serves the battery cameras, only while they're watched.
         self.neolink = Neolink(on_login_rejected=self._on_login_rejected)
         self.neolink.apply(self.settings.cameras)
         for cam in self.settings.cameras:
@@ -125,10 +126,18 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         cols = self.settings.columns or math.ceil(math.sqrt(len(tiles)))
         cols = max(1, min(cols, len(tiles)))
+        shown = self.shown if self.focused else tiles
+        if self.focused and len(shown) > 1:
+            # A dual-lens camera's lenses side by side; hidden tiles keep their cells.
+            cells = {tile: (i, 0) for i, tile in enumerate(shown)}
+        else:
+            cells = {tile: (i % cols, i // cols) for i, tile in enumerate(tiles)}
         # Tiles are only re-attached when their cell changes: re-attaching re-creates
         # the video widget's window, and the tile then has to rebuild its output.
-        for i, tile in enumerate(tiles):
-            cell = (i % cols, i // cols)
+        for tile in tiles:
+            cell = cells.get(tile)
+            if cell is None:
+                continue
             if tile.get_parent() is self.grid:
                 if cell == (self.grid.child_get_property(tile, "left-attach"),
                             self.grid.child_get_property(tile, "top-attach")):
@@ -138,7 +147,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # A maximized tile fills the grid because the hidden ones leave their
         # rows and columns empty, and empty grid lines take no space.
         for tile in tiles:
-            if self.focused is None or tile is self.focused:
+            if tile in shown:
                 tile.show_all()
             else:
                 tile.hide()
@@ -158,31 +167,42 @@ class MainWindow(Gtk.ApplicationWindow):
     def _apply_grid_stream(self) -> None:
         stream = self._grid_stream()
         for tile in self.tiles.values():
-            if tile is not self.focused:
+            if tile not in self.shown:
                 self._set_stream(tile, stream)
 
+    def _lenses(self, tile: CameraTile) -> list[CameraTile]:
+        """A dual-lens battery camera is one entry per lens (channel), sharing a UID."""
+        if not (tile.camera.on_demand and tile.camera.uid):
+            return [tile]
+        return [t for t in self.ordered_tiles()
+                if t.camera.on_demand and t.camera.uid == tile.camera.uid]
+
     def maximize(self, tile: CameraTile) -> None:
-        if self.focused is tile:
+        if tile in self.shown:
             return
         self.focused = tile
+        self.shown = self._lenses(tile)
         for other in self.tiles.values():
-            if other is not tile:
+            if other not in self.shown:
                 other.stop()  # save bandwidth/CPU/GPU memory while hidden
-        self._set_stream(tile, "main" if self.settings.hd_when_maximized else None)
-        if not tile.is_playing:
-            tile.start()
-        self.relayout()
+        self.relayout()  # lenses move side by side before they start
+        for lens in self.shown:
+            self._set_stream(lens, "main" if self.settings.hd_when_maximized else None)
+            if not lens.is_playing:
+                lens.start()
 
     def restore(self) -> None:
         if not self.focused:
             return
         self.focused = None
+        self.shown = []
+        for tile in self.tiles.values():
+            if tile.camera.on_demand:
+                tile.stop()  # back to sleep, before the stream switch restarts it
         self._apply_grid_stream()
         self.relayout()
         for tile in self.tiles.values():
-            if tile.camera.on_demand:
-                tile.stop()  # back to sleep
-            elif not tile.is_playing:
+            if not tile.is_playing and not tile.camera.on_demand:
                 tile.start()
 
     def toggle_fullscreen(self) -> None:
@@ -194,7 +214,8 @@ class MainWindow(Gtk.ApplicationWindow):
     # ------------------------------------------------------------- cameras
 
     def _create_tile(self, cam: Camera) -> CameraTile:
-        tile = CameraTile(cam, before_start=self.neolink.ensure_running)
+        tile = CameraTile(cam, wake=self.neolink.acquire, sleep=self.neolink.release,
+                          ready=self.neolink.ready)
         tile.connect("button-press-event", self._on_tile_click)
         self.tiles[cam.id] = tile
         return tile
@@ -237,7 +258,7 @@ class MainWindow(Gtk.ApplicationWindow):
         dlg.destroy()
         if answer != Gtk.ResponseType.YES:
             return
-        if self.focused is tile:
+        if tile in self.shown:
             self.restore()
         self.settings.cameras = [c for c in self.settings.cameras if c.id != tile.camera.id]
         self.app.save()
@@ -345,7 +366,7 @@ class MainWindow(Gtk.ApplicationWindow):
             mi.connect("activate", lambda *_: cb())
             menu.append(mi)
 
-        if self.focused is tile:
+        if tile in self.shown:
             item("Back to grid", self.restore)
         else:
             item("Maximize", lambda: self.maximize(tile))
@@ -408,9 +429,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _on_tile_click(self, tile: CameraTile, event: Gdk.EventButton) -> bool:
         if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
-            if self.focused is tile and tile.camera.on_demand and not tile.is_playing:
-                tile.start()  # maximized but asleep: wake it
-            elif self.focused is tile:
+            if tile in self.shown and tile.camera.on_demand and not tile.is_playing:
+                for lens in self.shown:  # maximized but asleep: wake it
+                    if not lens.is_playing:
+                        lens.start()
+            elif tile in self.shown:
                 self.restore()
             else:
                 self.maximize(tile)
