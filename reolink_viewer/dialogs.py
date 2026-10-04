@@ -9,7 +9,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk  # noqa: E402
 
-from .config import CODECS, DEFAULT_PORTS, PROTOCOLS, STREAMS, Camera  # noqa: E402
+from .config import CODECS, DEFAULT_PORTS, PROTOCOLS, STREAMS, Camera, rtmp_safe  # noqa: E402
 
 
 def _combo(options: dict[str, str], active: str) -> Gtk.ComboBoxText:
@@ -31,7 +31,9 @@ class CameraDialog(Gtk.Dialog):
         self.set_default_response(Gtk.ResponseType.OK)
 
         self._original = camera
-        cam = camera or Camera(name="")
+        # One base for a new camera, so its id (and URL preview) stays the same.
+        self._base = camera or Camera(name="")
+        cam = self._base
         self._prev_protocol = cam.protocol
 
         grid = Gtk.Grid(column_spacing=12, row_spacing=8, margin=16)
@@ -40,6 +42,8 @@ class CameraDialog(Gtk.Dialog):
         self.name = Gtk.Entry(text=cam.name, activates_default=True, placeholder_text="Front door")
         self.protocol = _combo(PROTOCOLS, cam.protocol)
         self.host = Gtk.Entry(text=cam.host, activates_default=True, placeholder_text="192.168.1.50")
+        self.uid = Gtk.Entry(text=cam.uid, activates_default=True,
+                             placeholder_text="Reolink app → camera → Settings → Device Info")
         self.port = Gtk.SpinButton.new_with_range(1, 65535, 1)
         self.port.set_value(cam.port or DEFAULT_PORTS.get(cam.protocol, 554))
         self.username = Gtk.Entry(text=cam.username, activates_default=True)
@@ -61,6 +65,8 @@ class CameraDialog(Gtk.Dialog):
         )
         self.preview = Gtk.Label(xalign=0, selectable=True, wrap=True)
         self.preview.get_style_context().add_class("dim-label")
+        self.hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        self.hint.get_style_context().add_class("dim-label")
 
         pw_box = Gtk.Box(spacing=6)
         pw_box.pack_start(self.password, True, True, 0)
@@ -70,6 +76,7 @@ class CameraDialog(Gtk.Dialog):
             ("Name", self.name),
             ("Protocol", self.protocol),
             ("Host / IP", self.host),
+            ("UID", self.uid),
             ("Port", self.port),
             ("Username", self.username),
             ("Password", pw_box),
@@ -79,6 +86,7 @@ class CameraDialog(Gtk.Dialog):
             ("Custom URL", self.custom_url),
             ("", self.audio),
             ("URL", self.preview),
+            ("", self.hint),
         ]
         self._rows: dict[Gtk.Widget, Gtk.Label] = {}
         for i, (label, widget) in enumerate(rows):
@@ -89,7 +97,7 @@ class CameraDialog(Gtk.Dialog):
             grid.attach(widget, 1, i, 1, 1)
             self._rows[widget] = lbl
 
-        for w in (self.name, self.host, self.username, self.password, self.custom_url):
+        for w in (self.name, self.host, self.uid, self.username, self.password, self.custom_url):
             w.connect("changed", self._refresh)
         for w in (self.stream, self.codec):
             w.connect("changed", self._refresh)
@@ -111,31 +119,49 @@ class CameraDialog(Gtk.Dialog):
     def _refresh(self, *_):
         proto = self.protocol.get_active_id()
         custom = proto == "custom"
-        for widget in (self.host, self.port, self.username, self.password.get_parent(),
-                       self.channel, self.stream):
-            widget.set_visible(not custom)
-            self._rows[widget].set_visible(not custom)
-        self.codec.set_visible(proto == "rtsp")
-        self._rows[self.codec].set_visible(proto == "rtsp")
-        self.custom_url.set_visible(custom)
-        self._rows[self.custom_url].set_visible(custom)
+        battery = proto == "battery"
+        shown = {
+            self.host: not (custom or battery),
+            self.port: not (custom or battery),
+            self.uid: battery,
+            self.username: not custom,
+            self.password.get_parent(): not custom,
+            self.channel: not (custom or battery),
+            self.stream: not custom,
+            self.codec: proto == "rtsp",
+            self.custom_url: custom,
+        }
+        for widget, visible in shown.items():
+            widget.set_visible(visible)
+            self._rows[widget].set_visible(visible)
 
         cam = self.get_camera()
         try:
-            url = cam.display_url() if (cam.host or custom) else ""
+            url = cam.display_url() if (cam.host or custom or battery) else ""
         except ValueError:
             url = ""
         self.preview.set_text(url)
-        valid = bool(cam.name.strip()) and bool(cam.custom_url.strip() if custom else cam.host.strip())
-        self._ok.set_sensitive(valid)
+        if battery:
+            hint = ("neolink finds the camera on your network by UID (Reolink's servers "
+                    "aren't used). It sleeps until you double-click its tile.")
+        elif proto == "rtsp" and cam.password and not rtmp_safe(cam):
+            hint = ("The grid will play this camera's sub stream: the balanced stream "
+                    "comes over RTMP, which only accepts passwords whose symbols "
+                    "are - _ . ~ or !")
+        else:
+            hint = ""
+        self.hint.set_text(hint)
+        self.hint.set_visible(bool(hint))
+        required = cam.custom_url if custom else cam.uid if battery else cam.host
+        self._ok.set_sensitive(bool(cam.name.strip()) and bool(required.strip()))
 
     def get_camera(self) -> Camera:
-        base = self._original or Camera(name="")
         return dataclasses.replace(
-            base,
+            self._base,
             name=self.name.get_text().strip(),
             protocol=self.protocol.get_active_id(),
             host=self.host.get_text().strip(),
+            uid="".join(self.uid.get_text().split()).upper(),
             port=int(self.port.get_value()),
             username=self.username.get_text().strip(),
             password=self.password.get_text(),

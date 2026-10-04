@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+from typing import Callable
 
 import gi
 
@@ -24,6 +25,11 @@ RETRY_MIN_S = 2
 RETRY_MAX_S = 30
 STALL_TIMEOUT_S = 20
 WATCHDOG_INTERVAL_S = 5
+# Battery cameras: how long to keep trying while one wakes up, and how long it
+# may stream before it goes back to sleep. Each minute awake costs battery.
+WAKE_TIMEOUT_S = 45
+AWAKE_LIMIT_S = 5 * 60
+ASLEEP = "Asleep · double-click to view"
 
 
 # Video output paths, best first. Each one that fails is skipped from then on:
@@ -325,11 +331,18 @@ def make_video_sink() -> VideoSink:
 
 
 class CameraTile(Gtk.EventBox):
-    """Shows one camera. Owns a playbin pipeline and restarts it on errors or stalls."""
+    """Shows one camera. Owns a playbin pipeline and restarts it on errors or stalls.
 
-    def __init__(self, camera: Camera):
+    Battery cameras (`camera.on_demand`) only play when started explicitly, give
+    up if they don't wake within WAKE_TIMEOUT_S, and stop after AWAKE_LIMIT_S.
+    """
+
+    def __init__(self, camera: Camera,
+                 before_start: Callable[[Camera], str | None] | None = None):
         super().__init__()
         self.camera = camera
+        # Returns why the camera can't be played right now, or None.
+        self._before_start = before_start
         self.stream_override: str | None = None
         # The balanced stream comes over RTMP, which a camera may have turned off.
         self._ext_worked = False
@@ -339,7 +352,9 @@ class CameraTile(Gtk.EventBox):
         self._backoff = RETRY_MIN_S
         self._last_frame = 0.0
         self._got_frame = False
-        self._status = "Stopped"
+        self._awake_since = 0.0
+        self._wake_deadline = 0.0  # battery cameras: give up waking after this
+        self._status = self._idle_status()
 
         # Let the event box receive clicks on top of the video widget.
         self.set_above_child(True)
@@ -392,7 +407,7 @@ class CameraTile(Gtk.EventBox):
         if self._wanted:
             self.restart()
         else:
-            self._update_label()
+            self._set_status(self._idle_status())
 
     def set_stream_override(self, stream: str | None) -> None:
         if stream == self.stream_override:
@@ -405,6 +420,12 @@ class CameraTile(Gtk.EventBox):
             self._update_label()
 
     def start(self) -> None:
+        """Start playing; for a battery camera, wake it."""
+        self._awake_since = time.monotonic()
+        self._wake_deadline = self._awake_since + WAKE_TIMEOUT_S if self.camera.on_demand else 0.0
+        self._connect()
+
+    def _connect(self) -> None:
         self._wanted = True
         self._cancel_retry()
         self._got_frame = False
@@ -417,10 +438,15 @@ class CameraTile(Gtk.EventBox):
         if not uri:
             self._set_status("No URL configured")
             return
+        if self._before_start:
+            problem = self._before_start(self.camera)
+            if problem:
+                self.stop(problem)
+                return
         if self.wanted_stream == "ext" and self.active_stream == "sub":
             log.info(
                 "[%s] playing the sub stream: the balanced one needs RTMP%s", self.camera.name,
-                ", which rejects this login (use letters and digits only)"
+                ", which rejects this login (only letters, digits and - _ . ~ ! work)"
                 if not rtmp_safe(self.camera) else ", which failed",
             )
         log.info("[%s] connecting to %s", self.camera.name, self.camera.display_url(self.active_stream))
@@ -428,7 +454,7 @@ class CameraTile(Gtk.EventBox):
         if self._sink_stale and not self._replace_stale_sink():
             return
         self._playbin.set_property("uri", uri)
-        self._set_status("Connecting…")
+        self._set_status("Waking camera…" if self.camera.on_demand else "Connecting…")
         if self._playbin.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             if self._sink.kind != "cpu" or GPU_ONLY:
                 # A synchronous failure here is almost always the GPU output
@@ -437,11 +463,11 @@ class CameraTile(Gtk.EventBox):
                 return
             self._schedule_reconnect("Failed to start")
 
-    def stop(self) -> None:
+    def stop(self, status: str | None = None) -> None:
         self._wanted = False
         self._cancel_retry()
         self._stop_pipeline()
-        self._set_status("Stopped")
+        self._set_status(status or self._idle_status())
 
     def restart(self) -> None:
         self._backoff = RETRY_MIN_S
@@ -657,6 +683,7 @@ class CameraTile(Gtk.EventBox):
         self._update_scale()  # source size is known now
         if self._wanted:
             self._backoff = RETRY_MIN_S
+            self._wake_deadline = 0.0
             if self.active_stream == "ext":
                 self._ext_worked = True
             self._set_status("Live")
@@ -701,7 +728,7 @@ class CameraTile(Gtk.EventBox):
         self._new_pipeline(sink)
         log.warning("%s video output failed; switching to %s", failed, self._sink.kind)
         if self._wanted:
-            self.start()
+            self._connect()
 
     def _watchdog(self) -> bool:
         if self._wanted and self._got_frame and log.isEnabledFor(logging.DEBUG):
@@ -722,6 +749,15 @@ class CameraTile(Gtk.EventBox):
             self._last_counters = now
         if (
             self._wanted
+            and self.camera.on_demand
+            and time.monotonic() - self._awake_since > AWAKE_LIMIT_S
+        ):
+            log.info("[%s] back to sleep after %d min to save battery",
+                     self.camera.name, AWAKE_LIMIT_S // 60)
+            self.stop(f"Asleep after {AWAKE_LIMIT_S // 60} min (battery) · double-click to view")
+            return True
+        if (
+            self._wanted
             and not self._retry_id
             and time.monotonic() - self._last_frame > STALL_TIMEOUT_S
         ):
@@ -735,21 +771,36 @@ class CameraTile(Gtk.EventBox):
         self._stop_pipeline()
         if not self._wanted or self._retry_id:
             return
-        delay = self._backoff
-        self._backoff = min(self._backoff * 2, RETRY_MAX_S)
+        if self.camera.on_demand:
+            # Retry while the camera wakes up (neolink refuses clients until it
+            # knows the stream format), but don't keep waking one that's gone.
+            now = time.monotonic()
+            if not self._wake_deadline:
+                self._wake_deadline = now + WAKE_TIMEOUT_S
+            if now > self._wake_deadline:
+                log.warning("[%s] didn't wake: %s", self.camera.name, reason)
+                self.stop("Camera didn't wake (UID, Wi-Fi?) · double-click to try again")
+                return
+            delay = RETRY_MIN_S
+        else:
+            delay = self._backoff
+            self._backoff = min(self._backoff * 2, RETRY_MAX_S)
         self._set_status(f"{reason} — retrying in {delay}s")
         self._retry_id = GLib.timeout_add_seconds(delay, self._on_retry)
 
     def _on_retry(self) -> bool:
         self._retry_id = 0
         if self._wanted:
-            self.start()
+            self._connect()
         return False
 
     def _cancel_retry(self) -> None:
         if self._retry_id:
             GLib.source_remove(self._retry_id)
             self._retry_id = 0
+
+    def _idle_status(self) -> str:
+        return ASLEEP if self.camera.on_demand else "Stopped"
 
     def _set_status(self, status: str) -> None:
         self._status = status

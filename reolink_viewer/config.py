@@ -16,9 +16,13 @@ PROTOCOLS = {
     "rtsp": "RTSP",
     "rtmp": "RTMP",
     "flv": "HTTP-FLV",
+    "battery": "Battery camera (via neolink)",
     "custom": "Custom URL",
 }
-DEFAULT_PORTS = {"rtsp": 554, "rtmp": 1935, "flv": 80, "custom": 0}
+DEFAULT_PORTS = {"rtsp": 554, "rtmp": 1935, "flv": 80, "battery": 0, "custom": 0}
+# Battery cameras have no RTSP server of their own: neolink wakes them over
+# Reolink's own protocol and serves them here, to this computer only.
+NEOLINK_PORT = 18554
 
 STREAMS = {
     "main": "Main (high quality)",
@@ -49,6 +53,7 @@ class Camera:
     codec: str = "h264"
     audio: bool = False
     custom_url: str = ""
+    uid: str = ""  # battery cameras: the UID from the Reolink app's Device Info
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     @classmethod
@@ -64,6 +69,11 @@ class Camera:
 
     def display_url(self, stream: str | None = None) -> str:
         return redact_url(self.url(stream))
+
+    @property
+    def on_demand(self) -> bool:
+        """Streams only while someone watches: every minute awake costs battery."""
+        return self.protocol == "battery"
 
 
 def _host_port(cam: Camera) -> str:
@@ -83,20 +93,30 @@ def _userinfo(cam: Camera) -> str:
     return info + "@"
 
 
+# Reolink's RTMP server reads the login from the URL query without decoding it,
+# so it has to be there literally. Besides letters, digits and - _ . ~ (never
+# encoded), "!" works as is (checked 2026-10-04).
+QUERY_LITERAL = "!"
+
+
 def rtmp_safe(cam: Camera) -> bool:
     """Whether Reolink's RTMP / HTTP-FLV servers will accept the camera's login.
 
-    Those take the username and password in the URL query and reject ones that
-    need URL-encoding, which RTSP accepts. Every rejection counts toward the
-    camera's login lockout, and a locked-out camera refuses RTSP too.
+    Those take the username and password in the URL query, where any character
+    that needs URL-encoding gets rejected (RTSP accepts them). Every rejection
+    counts toward the camera's login lockout, and a locked-out camera refuses
+    RTSP too.
     """
-    return all(quote(text, safe="") == text for text in (cam.username, cam.password))
+    return all(quote(text, safe=QUERY_LITERAL) == text for text in (cam.username, cam.password))
 
 
 def resolve_stream(cam: Camera, stream: str) -> str:
     """The stream that can actually be played: RTSP cameras get the balanced
-    stream over RTMP, which needs an RTMP-safe login, so otherwise sub."""
-    if stream == "ext" and cam.protocol == "rtsp" and not rtmp_safe(cam):
+    stream over RTMP, which needs an RTMP-safe login, so otherwise sub.
+    Battery cameras have no balanced stream."""
+    if stream == "ext" and (
+        cam.protocol == "battery" or (cam.protocol == "rtsp" and not rtmp_safe(cam))
+    ):
         return "sub"
     return stream
 
@@ -107,8 +127,14 @@ def build_url(cam: Camera, stream: str | None = None) -> str:
     RTSP:     rtsp://user:pass@host:554/h264Preview_01_main
     RTMP:     rtmp://host:1935/bcs/channel0_main.bcs?channel=0&stream=0&user=..&password=..
     HTTP-FLV: http://host:80/flv?port=1935&app=bcs&stream=channel0_main.bcs&user=..&password=..
+    Battery:  rtsp://127.0.0.1:18554/<camera id>/mainStream (served by neolink)
     """
     stream = stream or cam.stream
+    if cam.protocol == "battery":
+        if not cam.uid.strip():
+            raise ValueError(f"Camera '{cam.name}' has no UID")
+        kind = "mainStream" if stream == "main" else "subStream"
+        return f"rtsp://127.0.0.1:{NEOLINK_PORT}/{cam.id}/{kind}"
     if cam.protocol == "rtsp" and stream == "ext":
         # Reolink's RTSP server has no balanced stream, but its RTMP server does.
         cam = replace(cam, protocol="rtmp", port=DEFAULT_PORTS["rtmp"])
@@ -131,12 +157,15 @@ def build_url(cam: Camera, stream: str | None = None) -> str:
 
     if proto == "rtmp":
         query = urlencode(
-            {"channel": ch, "stream": 1 if stream == "sub" else 0, **creds}
+            {"channel": ch, "stream": 1 if stream == "sub" else 0, **creds},
+            safe=QUERY_LITERAL,
         )
         return f"rtmp://{_host_port(cam)}/bcs/{stream_name}?{query}"
 
     if proto == "flv":
-        query = urlencode({"port": 1935, "app": "bcs", "stream": stream_name, **creds})
+        query = urlencode(
+            {"port": 1935, "app": "bcs", "stream": stream_name, **creds}, safe=QUERY_LITERAL
+        )
         return f"http://{_host_port(cam)}/flv?{query}"
 
     raise ValueError(f"Unknown protocol: {proto}")

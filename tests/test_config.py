@@ -2,6 +2,7 @@ import os
 import stat
 
 from reolink_viewer.config import (
+    NEOLINK_PORT,
     Camera,
     Settings,
     build_url,
@@ -32,10 +33,17 @@ def test_rtsp_camera_gets_balanced_stream_over_rtmp():
 def test_balanced_stream_needs_rtmp_safe_login():
     # RTMP takes the login in the URL query and rejects anything needing escaping.
     assert resolve_stream(Camera(name="x", password="Abc123"), "ext") == "ext"
-    assert resolve_stream(Camera(name="x", password="Abc!123"), "ext") == "sub"
-    assert resolve_stream(Camera(name="x", password="Abc!123"), "main") == "main"
+    assert resolve_stream(Camera(name="x", password="Abc#123"), "ext") == "sub"
+    assert resolve_stream(Camera(name="x", password="Abc#123"), "main") == "main"
     # RTMP / FLV cameras were set up that way on purpose.
-    assert resolve_stream(Camera(name="x", password="Abc!123", protocol="rtmp"), "ext") == "ext"
+    assert resolve_stream(Camera(name="x", password="Abc#123", protocol="rtmp"), "ext") == "ext"
+
+
+def test_exclamation_mark_goes_into_rtmp_url_literally():
+    # Reolink doesn't decode the query: "%21" is rejected, "!" works.
+    cam = Camera(name="x", host="h", password="12!34", stream="ext")
+    assert resolve_stream(cam, "ext") == "ext"
+    assert build_url(cam).endswith("&user=admin&password=12!34")
 
 
 def test_password_special_chars_are_escaped():
@@ -104,3 +112,22 @@ def test_unknown_keys_ignored():
 
 def test_missing_config_gives_defaults(tmp_path):
     assert load_settings(tmp_path / "nope.json").cameras == []
+
+
+def test_battery_camera_plays_from_neolink():
+    cam = Camera(name="Driveway", protocol="battery", uid="ABCDEF0123456789", id="abc123")
+    assert cam.on_demand
+    assert build_url(cam, "main") == f"rtsp://127.0.0.1:{NEOLINK_PORT}/abc123/mainStream"
+    # No balanced stream: the grid plays sub.
+    assert resolve_stream(cam, "ext") == "sub"
+    assert build_url(cam, "sub").endswith("/abc123/subStream")
+    assert not Camera(name="x").on_demand
+
+
+def test_battery_camera_needs_uid():
+    try:
+        build_url(Camera(name="x", protocol="battery"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")

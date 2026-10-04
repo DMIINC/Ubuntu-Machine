@@ -16,11 +16,14 @@ for e in vah264dec vah265dec vaapih264dec vaapih265dec nvh264dec nvh265dec avdec
     rank=$(gst-inspect-1.0 "$e" 2>/dev/null | grep -m1 -i "rank" | sed 's/^ *//')
     [ -n "$rank" ] && echo "$e: $rank"
 done
+NEOLINK="$(PYTHONPATH="$HERE" /usr/bin/python3 -c 'from reolink_viewer.neolink import find_binary; print(find_binary() or "")')"
+echo; echo "neolink (battery cameras): ${NEOLINK:-not installed}${NEOLINK:+ ($("$NEOLINK" --version 2>/dev/null | tail -1))}"
 command -v vainfo >/dev/null && { echo; echo "=== vainfo"; vainfo 2>&1 | grep -E "Driver version|VAProfileH26[45]|error" | head -12; }
 
 mapfile -t CAMS < <(PYTHONPATH="$HERE" /usr/bin/python3 -c '
 from reolink_viewer.config import load_settings, default_config_path
-for c in load_settings(default_config_path()).cameras[:2]:
+# Battery cameras are left out: a test would wake them.
+for c in [c for c in load_settings(default_config_path()).cameras if not c.on_demand][:2]:
     print(c.name + "\t" + (c.host or "") + "\t" + c.url("main") + "\t" + c.url("sub"))')
 
 for line in "${CAMS[@]}"; do

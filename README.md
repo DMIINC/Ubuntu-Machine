@@ -11,7 +11,8 @@ It's built with Python, GTK 3 and GStreamer, which are all native Ubuntu package
 - Supports **RTSP** (default), **RTMP**, **HTTP-FLV** or any custom stream URL
 - Supports H.264 and H.265 (HEVC) cameras, and NVR channels 1–64
 - With more than one camera, the grid plays each camera's **balanced** stream (e.g. 896×512), whatever stream the camera is set to (menu: **Grid stream**). A 4K main stream holds over 1 GB of GPU memory, so a grid of them can run the graphics card out of memory. Double-clicking a camera maximizes it and switches to the **main** (4K/HD) stream. The other cameras pause to save bandwidth and GPU memory.
-- Reolink serves the balanced stream only over RTMP, so RTSP cameras fetch it over RTMP. Reolink's RTMP rejects passwords with symbols (RTSP accepts them), so a camera whose password isn't letters and digits only plays its **sub** stream in the grid instead. The viewer never tries RTMP with such a password, because failed logins count toward the camera's lockout.
+- Reolink serves the balanced stream only over RTMP, so RTSP cameras fetch it over RTMP. Reolink's RTMP rejects passwords with symbols other than `- _ . ~ !` (RTSP accepts any), so a camera with another symbol in its password plays its **sub** stream in the grid instead. The viewer never tries RTMP with such a password, because failed logins count toward the camera's lockout. A camera with RTMP turned off also plays sub.
+- **Battery cameras** (Argus, battery Duo, …) through [neolink](https://github.com/QuantumEntangledAndy/neolink), which the viewer runs in the background. They sleep until you double-click their tile, go back to sleep when you return to the grid, and after 5 minutes at most. Reolink's servers aren't used: neolink finds the camera on your network by its UID.
 - Reconnects automatically with backoff when a camera drops, errors or stops sending video
 - Saves **snapshots** as PNG files to `~/Pictures/Reolink/`
 - Optional audio for each camera
@@ -26,7 +27,7 @@ cd reolink-viewer
 ./install.sh            # installs for your user (~/.local); use --system for /usr/local
 ```
 
-The script installs these apt packages: `python3-gi`, `gir1.2-gtk-3.0`, GStreamer base, good, bad, ugly and libav plugins, `gstreamer1.0-gtk3` and `gstreamer1.0-vaapi`. It also adds **Reolink Viewer** to your applications menu.
+The script installs these apt packages: `python3-gi`, `gir1.2-gtk-3.0`, GStreamer base, good, bad, ugly and libav plugins, `gstreamer1.0-gtk3`, `gstreamer1.0-vaapi` and `libgstrtspserver-1.0-0`. It downloads neolink 0.6.3-rc.2 from its GitHub release (checking the file's SHA-256), and adds **Reolink Viewer** to your applications menu.
 
 To run it without installing (once the apt packages are present):
 
@@ -40,6 +41,12 @@ To run it without installing (once the apt packages are present):
 2. In Reolink Viewer, click **+** and enter the camera's IP address, username (usually `admin`) and password.
 3. Leave the protocol set to RTSP and the port at 554. For cameras encoding H.265 (many 4K/8MP models), set **Codec** to **H.265**.
 4. For an **NVR** or Home Hub, use the NVR's IP address and add one entry per camera, with **Channel** set to 1, 2, 3…
+
+### Battery cameras
+
+Battery cameras have no RTSP or RTMP server; the Reolink app wakes them over Reolink's own protocol. Set **Protocol** to **Battery camera (via neolink)**, then enter the camera's **UID** (Reolink app → camera → Settings → Device Info; mind `0` vs `O`), username and password. The grid plays the sub stream and a maximized camera the main stream; there is no balanced stream.
+
+The tile shows *Asleep* until you double-click it. Waking takes a few seconds; if the camera can't be reached within 45 s, the tile says so and stops trying. Each wake costs battery, so the camera sleeps again when you go back to the grid, and after 5 minutes. Right-click a tile for **Wake** / **Sleep now**.
 
 URLs the app generates:
 
@@ -74,7 +81,8 @@ Cameras are stored in `~/.config/reolink-viewer/config.json`. The file is create
 ## Troubleshooting
 
 - **`Unauthorized`**: the username or password is wrong. Special characters are handled correctly.
-- **Black tile or `No video`**: make sure RTSP is enabled on the camera. Also try the H.265 codec setting, or switch the protocol to RTMP/FLV. Newer battery cameras and some doorbells only stream through a Home Hub or NVR.
+- **Black tile or `No video`**: make sure RTSP is enabled on the camera. Also try the H.265 codec setting, or switch the protocol to RTMP/FLV. For battery cameras, see [Battery cameras](#battery-cameras).
+- **Battery camera won't wake**: check the UID, and that the camera has Wi-Fi signal (it must be on the same network as this computer). `reolink-viewer -v` shows neolink's log. If the password is wrong, neolink stops at the first rejection and the tile says so; it tries again only after you edit the camera.
 - **Choppy video**: run `reolink-viewer -v` from a terminal. Every 5 seconds each camera logs `NN fps shown, N dropped (gl|sw output)` and names its decoder, which tells you whether the network, decoding or display is the bottleneck. Things to try:
   - Switch **Protocol** to **HTTP-FLV** (port 80). Reolink's RTSP implementation is often the weakest option.
   - In the Reolink app, set the camera's Clear stream to a fixed frame rate (20–25), and consider a 4 Mbps+ bitrate over a wired connection.
@@ -96,4 +104,5 @@ Code layout:
 - `reolink_viewer/config.py`: camera model, URL building and saving/loading the config
 - `reolink_viewer/player.py`: `CameraTile`, a GStreamer `playbin` + `gtksink` widget with reconnect/watchdog
 - `reolink_viewer/dialogs.py`: the add/edit camera dialog
+- `reolink_viewer/neolink.py`: runs neolink for battery cameras and writes its config (in `$XDG_RUNTIME_DIR`, removed on exit)
 - `reolink_viewer/app.py`: main window, grid, menus and shortcuts

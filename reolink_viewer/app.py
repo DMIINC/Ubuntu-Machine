@@ -26,6 +26,7 @@ from .config import (  # noqa: E402
     save_settings,
 )
 from .dialogs import CameraDialog  # noqa: E402
+from .neolink import Neolink  # noqa: E402
 from . import player  # noqa: E402
 from .player import CameraTile  # noqa: E402
 
@@ -97,13 +98,17 @@ class MainWindow(Gtk.ApplicationWindow):
         self.connect("window-state-event", self._on_window_state)
         self.connect("delete-event", self._on_delete)
 
+        # Serves the battery cameras; started now so a first wake is quick.
+        self.neolink = Neolink(on_login_rejected=self._on_login_rejected)
+        self.neolink.apply(self.settings.cameras)
         for cam in self.settings.cameras:
             self._create_tile(cam)
         self._apply_grid_stream()
         self.show_all()
         self.relayout()
         for tile in self.tiles.values():
-            tile.start()
+            if not tile.camera.on_demand:  # battery cameras sleep until opened
+                tile.start()
 
     # --------------------------------------------------------------- layout
 
@@ -175,7 +180,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._apply_grid_stream()
         self.relayout()
         for tile in self.tiles.values():
-            if not tile.is_playing:
+            if tile.camera.on_demand:
+                tile.stop()  # back to sleep
+            elif not tile.is_playing:
                 tile.start()
 
     def toggle_fullscreen(self) -> None:
@@ -187,7 +194,7 @@ class MainWindow(Gtk.ApplicationWindow):
     # ------------------------------------------------------------- cameras
 
     def _create_tile(self, cam: Camera) -> CameraTile:
-        tile = CameraTile(cam)
+        tile = CameraTile(cam, before_start=self.neolink.ensure_running)
         tile.connect("button-press-event", self._on_tile_click)
         self.tiles[cam.id] = tile
         return tile
@@ -198,6 +205,7 @@ class MainWindow(Gtk.ApplicationWindow):
             cam = dlg.get_camera()
             self.settings.cameras.append(cam)
             self.app.save()
+            self.neolink.apply(self.settings.cameras)
             tile = self._create_tile(cam)
             self._apply_grid_stream()
             if self.focused:
@@ -214,6 +222,7 @@ class MainWindow(Gtk.ApplicationWindow):
             idx = next(i for i, c in enumerate(self.settings.cameras) if c.id == cam.id)
             self.settings.cameras[idx] = cam
             self.app.save()
+            self.neolink.apply(self.settings.cameras)
             tile.set_camera(cam)
         dlg.destroy()
 
@@ -232,6 +241,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.restore()
         self.settings.cameras = [c for c in self.settings.cameras if c.id != tile.camera.id]
         self.app.save()
+        self.neolink.apply(self.settings.cameras)
         del self.tiles[tile.camera.id]
         tile.destroy()
         self._apply_grid_stream()
@@ -343,7 +353,13 @@ class MainWindow(Gtk.ApplicationWindow):
             other = "sub" if tile.active_stream == "main" else "main"
             item(f"Switch to {other} stream", lambda: tile.set_stream_override(other))
         item("Snapshot", lambda: self.take_snapshot(tile))
-        item("Reconnect", tile.reconnect)
+        if tile.camera.on_demand:
+            if tile.is_playing:
+                item("Sleep now", tile.stop)
+            else:
+                item("Wake", tile.start)
+        else:
+            item("Reconnect", tile.reconnect)
         menu.append(Gtk.SeparatorMenuItem())
         item("Move earlier", lambda: self.move_camera(tile, -1), self.focused is None)
         item("Move later", lambda: self.move_camera(tile, +1), self.focused is None)
@@ -392,7 +408,9 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _on_tile_click(self, tile: CameraTile, event: Gdk.EventButton) -> bool:
         if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
-            if self.focused is tile:
+            if self.focused is tile and tile.camera.on_demand and not tile.is_playing:
+                tile.start()  # maximized but asleep: wake it
+            elif self.focused is tile:
                 self.restore()
             else:
                 self.maximize(tile)
@@ -433,9 +451,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.is_fullscreen = bool(event.new_window_state & Gdk.WindowState.FULLSCREEN)
         return False
 
+    def _on_login_rejected(self, cam_id: str) -> None:
+        tile = self.tiles.get(cam_id)
+        if tile:
+            tile.stop("Login rejected: check the password (Edit…)")
+
     def _on_delete(self, *_):
         for tile in self.tiles.values():
             tile.dispose()
+        self.neolink.stop()
         return False
 
 
@@ -476,6 +500,11 @@ class ViewerApp(Gtk.Application):
             player.configure(self.settings.gpu_only)
             self.window = MainWindow(self)
         self.window.present()
+
+    def do_shutdown(self):
+        if self.window is not None:
+            self.window.neolink.stop()  # Ctrl+Q skips the window's delete-event
+        Gtk.Application.do_shutdown(self)
 
     def save(self) -> None:
         if not self.persist:
