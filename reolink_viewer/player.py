@@ -27,7 +27,7 @@ STALL_TIMEOUT_S = 20
 WATCHDOG_INTERVAL_S = 5
 # Battery cameras: how long to keep trying while one wakes up, and how long it
 # may stream before it goes back to sleep. Each minute awake costs battery.
-WAKE_TIMEOUT_S = 45
+WAKE_TIMEOUT_S = 60
 AWAKE_LIMIT_S = 5 * 60
 NEOLINK_TIMEOUT_US = 10_000_000  # rtspsrc gives up on an unanswered request (default 20 s)
 ASLEEP = "Asleep · double-click to view"

@@ -75,6 +75,7 @@ def config_text(awake: list[tuple[Camera, str]]) -> str:
             f"username = {_toml(cam.username)}",
             f"password = {_toml(cam.password)}",
             f"uid = {_toml(cam.uid.strip())}",
+            *_address(cam),
             f"channel_id = {max(cam.channel, 1) - 1}",
             'discovery = "local"',  # LAN broadcast only, never Reolink's servers
             f"stream = {_toml(STREAM_PATHS.get(stream, 'subStream'))}",
@@ -85,6 +86,15 @@ def config_text(awake: list[tuple[Camera, str]]) -> str:
             "update_time = false",
         ]
     return "\n".join(lines) + "\n"
+
+
+def _address(cam: Camera) -> list[str]:
+    """With the camera's IP as well as its UID, neolink sends its wake-up packets
+    straight to the camera (ports 2015/2018) besides broadcasting them. After a
+    longer idle the Duo ignored the broadcasts (2026-10-04), though it still
+    answered ping, which Wi-Fi power saving delivers like any unicast."""
+    host = cam.host.strip()
+    return [f"address = {_toml(host)}"] if host else []
 
 
 def _die_with_parent() -> None:

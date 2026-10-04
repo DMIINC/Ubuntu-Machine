@@ -121,7 +121,7 @@ class CameraDialog(Gtk.Dialog):
         custom = proto == "custom"
         battery = proto == "battery"
         shown = {
-            self.host: not (custom or battery),
+            self.host: not custom,  # optional for battery cameras
             self.port: not (custom or battery),
             self.uid: battery,
             self.username: not custom,
@@ -141,6 +141,8 @@ class CameraDialog(Gtk.Dialog):
         except ValueError:
             url = ""
         self.preview.set_text(url)
+        self.host.set_placeholder_text(
+            "Optional: helps wake it from deep sleep" if battery else "192.168.1.50")
         self.channel.set_tooltip_text(
             "Lens: 2 for a dual-lens camera's second lens" if battery
             else "Use 1 for a standalone camera; NVR / Home Hub channel otherwise")

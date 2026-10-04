@@ -8,7 +8,7 @@ def test_config_serves_awake_battery_cameras_locally():
     lens1 = Camera(name="Driveway", protocol="battery", uid=" ABCDEF0123456789 ",
                    password='p"a\\ss!word', id="abc123")
     lens2 = Camera(name="Driveway 2", protocol="battery", uid="ABCDEF0123456789",
-                   channel=2, id="def456")
+                   host=" 192.168.1.35 ", channel=2, id="def456")
     conf = tomllib.loads(config_text([(lens1, "main"), (lens2, "sub")]))
     assert conf["bind"] == "127.0.0.1"
     assert conf["bind_port"] == NEOLINK_PORT
@@ -24,3 +24,6 @@ def test_config_serves_awake_battery_cameras_locally():
     assert (second["stream"], second["channel_id"]) == ("subStream", 1)
     # neolink runs only while watched, so its own pause / idle handling is off.
     assert "pause" not in first and "idle_disconnect" not in first
+    # With an IP, wake-ups also go straight to the camera, not only by broadcast.
+    assert "address" not in first
+    assert second["address"] == "192.168.1.35"

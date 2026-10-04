@@ -44,11 +44,11 @@ To run it without installing (once the apt packages are present):
 
 ### Battery cameras
 
-Battery cameras have no RTSP or RTMP server; the Reolink app wakes them over Reolink's own protocol. Set **Protocol** to **Battery camera (via neolink)**, then enter the camera's **UID** (Reolink app → camera → Settings → Device Info; mind `0` vs `O`), username and password. The grid plays the sub stream and a maximized camera the main stream; there is no balanced stream.
+Battery cameras have no RTSP or RTMP server; the Reolink app wakes them over Reolink's own protocol. Set **Protocol** to **Battery camera (via neolink)**, then enter the camera's **UID** (Reolink app → camera → Settings → Device Info; mind `0` vs `O`), username and password. Also enter its **IP address** if it's fixed (e.g. a DHCP reservation): after a long idle the camera may ignore broadcasts, and neolink then also wakes it directly. The grid plays the sub stream and a maximized camera the main stream; there is no balanced stream.
 
 For a **dual-lens** camera (e.g. Reolink Duo), add it twice with the same UID: **Channel** 1 for the first lens and 2 for the second. Double-clicking either one shows both lenses side by side.
 
-The tile shows *Asleep* until you double-click it. Waking the Reolink Duo took 40–45 s to live video on both lenses (neolink is ready after ~15 s; its first connection often stalls and is retried). If the camera can't be reached within 45 s, the tile says so and stops trying. Each wake costs battery, so the camera sleeps again when you go back to the grid, and after 5 minutes. Right-click a tile for **Wake** / **Sleep now**.
+The tile shows *Asleep* until you double-click it. Waking the Reolink Duo took 40–45 s to live video on both lenses (neolink is ready after ~15 s; its first connection often stalls and is retried). If the camera can't be reached within 60 s, the tile says so and stops trying. Each wake costs battery, so the camera sleeps again when you go back to the grid, and after 5 minutes. Right-click a tile for **Wake** / **Sleep now**.
 
 URLs the app generates:
 
