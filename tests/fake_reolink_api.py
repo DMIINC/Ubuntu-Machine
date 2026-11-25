@@ -59,8 +59,21 @@ class FakeCamera:
         self.redirect_to = redirect_to
         self.clip_bytes = clip_bytes
         self.refuse_playback: str | None = None  # a detail text: Playback answers with that error
+        # Firmware faults seen on real cameras: a new token is refused for this many
+        # seconds after the login; "stuck" refuses every token while logins still work.
+        self.token_settle_s = 0.0
+        self.stuck = False
+        # bind_tokens: a token only works on the TCP connection its Login came on
+        # (reported for new NVR firmware); close_connections: no keep-alive.
+        self.bind_tokens = False
+        self.close_connections = False
+        self.requests: list[tuple[int, str]] = []  # (client port, cmd or path) of each request
+        self.hosts: list[str] = []  # the Host header of each request
+        self._token_conn: dict[str, int] = {}
+        self._local = threading.local()
         self.login_attempts = 0
         self.tokens: set[str] = set()
+        self._issued: dict[str, float] = {}
         self.paths: list[str] = []  # every request path, to prove what went into URLs
         self.commands: list[str] = []
         self.clips: list[dict] = []
@@ -93,6 +106,12 @@ class FakeCamera:
     def add_clips(self, *clips: dict) -> None:
         self.clips.extend(clips)
 
+    def token_ok(self, token: str) -> bool:
+        if self.bind_tokens and self._token_conn.get(token) != getattr(self._local, "port", None):
+            return False
+        return (token in self.tokens and not self.stuck
+                and time.monotonic() - self._issued.get(token, 0) >= self.token_settle_s)
+
     # ------------------------------------------------------------- commands
 
     def _answer(self, cmd: dict, token: str) -> dict:
@@ -111,12 +130,14 @@ class FakeCamera:
                 return error(-7, "login failed")
             new = secrets.token_hex(6)
             self.tokens.add(new)
+            self._issued[new] = time.monotonic()
+            self._token_conn[new] = getattr(self._local, "port", 0)
             return {"cmd": name, "code": 0, "value": {"Token": {"leaseTime": 3600, "name": new}}}
-        if token not in self.tokens:
-            return error(-6, "please login first")
-        if name == "Logout":
-            self.tokens.discard(token)
+        if name == "Logout" and token in self.tokens:
+            self.tokens.discard(token)  # also when the camera refuses everything else
             return {"cmd": name, "code": 0, "value": {"rspCode": 200}}
+        if not self.token_ok(token):
+            return error(-6, "please login first")
         param = cmd.get("param", {})
         if name == "Search":
             return self._search(param.get("Search", {}))
@@ -197,6 +218,13 @@ class FakeCamera:
                 if self.command != "HEAD":
                     self.wfile.write(body)
 
+            def _note(self, what: str) -> None:
+                camera._local.port = self.client_address[1]
+                camera.requests.append((self.client_address[1], what))
+                camera.hosts.append(self.headers.get("Host", ""))
+                if camera.close_connections:
+                    self.close_connection = True
+
             def do_POST(self) -> None:
                 camera.paths.append(self.path)
                 length = int(self.headers.get("Content-Length") or 0)
@@ -211,12 +239,14 @@ class FakeCamera:
                 except ValueError:
                     self._send(400, b"bad request", "text/html")
                     return
+                self._note(",".join(str(cmd.get("cmd")) for cmd in commands))
                 answer = [camera._answer(cmd, token) for cmd in commands]
                 # Real cameras label their JSON as text/html.
                 self._send(200, json.dumps(answer).encode(), "text/html")
 
             def do_GET(self) -> None:
                 camera.paths.append(self.path)
+                self._note(self.path)
                 if camera.redirect_to:
                     self._send(302, b"", "text/html", {"Location": camera.redirect_to + self.path})
                     return
@@ -225,7 +255,7 @@ class FakeCamera:
                 if parts.path != "/cgi-bin/api.cgi" or (query.get("cmd") or [""])[0] != "Playback":
                     self._send(404, b"not found", "text/html")
                     return
-                if (query.get("token") or [""])[0] not in camera.tokens:
+                if not camera.token_ok((query.get("token") or [""])[0]):
                     body = json.dumps([{"cmd": "Playback", "code": 1,
                                         "error": {"detail": "please login first", "rspCode": -6}}])
                     self._send(200, body.encode(), "text/html")

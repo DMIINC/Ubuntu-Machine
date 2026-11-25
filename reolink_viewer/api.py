@@ -30,17 +30,18 @@ import re
 import ssl
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from .config import DEFAULT_PORTS, Camera, rtmp_safe
 
 log = logging.getLogger(__name__)
 
 TIMEOUT_S = 10
+USER_AGENT = "reolink-viewer"
+# How a kept-alive connection the camera has closed meanwhile shows up.
+_CLOSED = (ConnectionError, http.client.RemoteDisconnected, ssl.SSLEOFError, ssl.SSLZeroReturnError)
 SEARCH_TIMEOUT_S = 25  # searching an SD card can take a while
 LOGOUT_TIMEOUT_S = 2
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -50,11 +51,28 @@ MAX_SEARCH_PAGES = 30
 PLAYBACK_LEASE_MARGIN_S = 300
 # HTTPS first: several cameras ship with plain HTTP turned off.
 DEFAULT_API_PORTS = ((443, True), (80, False))
+# Some firmware refuses a token it has only just handed out ("please login first";
+# reolink_aio saw it on an RLC-520A). Such a token is asked with again after these
+# pauses before the session is renewed.
+FRESH_TOKEN_S = 15
+FRESH_TOKEN_WAITS_S = (1.0, 4.0)  # openHAB's Reolink binding waits 5 s
+# A camera that refused a renewed session as well isn't asked again sooner than this.
+STUCK_RETRY_S = 60
 
 # Reolink's error details that mean "wrong login" or "locked out".
 _CREDENTIAL_DETAILS = ("invalid user", "login failed", "password wrong", "locked")
 _CREDENTIAL_CODES = (-7, -27, -28)  # login failed, invalid user, user not exist
 _LOGIN_FIRST = -6  # "please login first": the token expired or was dropped
+
+
+def _says_login_first(code: int, detail: str) -> bool:
+    return code == _LOGIN_FIRST or "login first" in detail.lower()
+
+
+_STUCK = ("The camera accepted the login but then refused the request as not logged in "
+          "(“please login first”), with a second new session too. Some Reolink firmware gets "
+          "stuck like this until the camera restarts. Try again in a minute; if it keeps "
+          "happening, restart the camera.")
 _NOT_SUPPORTED = (-9, -26)  # not support, ability error
 
 
@@ -186,13 +204,6 @@ def _parse_recording(data: dict, stream: str) -> Recording | None:
                      playback_start)
 
 
-class _NoRedirects(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect: a login must not be re-sent to wherever one points."""
-
-    def redirect_request(self, *_args, **_kwargs):
-        return None
-
-
 def tls_context(legacy: bool = False) -> ssl.SSLContext:
     """TLS settings for talking to a camera. Cameras present self-signed
     certificates, so there is nothing to verify them against (the same settings
@@ -207,13 +218,6 @@ def tls_context(legacy: bool = False) -> ssl.SSLContext:
     else:
         context.set_ciphers("DEFAULT")
     return context
-
-
-def _opener(context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
-    handlers: list = [_NoRedirects(), urllib.request.ProxyHandler({})]  # cameras are on the LAN
-    if context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=context))
-    return urllib.request.build_opener(*handlers)
 
 
 def _error_of(item: dict) -> tuple[int, str]:
@@ -295,6 +299,13 @@ class CameraApi:
         self._token = ""
         self._token_expires = 0.0
         self._login_at = 0.0  # when the camera last handed out a token
+        self._stuck_at = 0.0  # when a renewed session was refused too
+        # The kept-alive connection the session's requests go over (http.client
+        # neither follows redirects nor uses a proxy: cameras are on the LAN).
+        self._conn: http.client.HTTPConnection | None = None
+        self._conn_key: tuple[str, bool] | None = None  # (base, old TLS) it was made for
+        self._conn_number = 0  # connections opened so far, for the log
+        self._conn_uses = 0  # requests sent on the current one
 
     # ------------------------------------------------------------- identity
 
@@ -389,15 +400,21 @@ class CameraApi:
 
     def forget_token(self, url_or_token: str) -> bool:
         """The camera refused a playback URL with "please login first" (it restarted,
-        or the session ran out while the computer slept). Drop that token so the
-        next playback_url() logs in afresh, which is safe: this login was accepted.
-        Only the token in question is dropped, so two clips refused at once cause
-        one new login. Returns whether it was still the current one."""
+        or the session ran out while the computer slept). Give that session back
+        and drop it, so the next playback_url() logs in afresh, which is safe: this
+        login was accepted. Only the token in question is dropped, so two clips
+        refused at once cause one new login. Returns whether it was still the current one."""
         with self._lock:
             if self._token and self._token in url_or_token:
-                self._token, self._token_expires = "", 0.0
+                self.logout()
                 return True
             return False
+
+    def token_is_fresh(self, url_or_token: str) -> bool:
+        """Whether this is the current token and the camera handed it out only just now."""
+        with self._lock:
+            return (bool(self._token) and self._token in url_or_token
+                    and _now() - self._login_at < FRESH_TOKEN_S)
 
     def logout(self, timeout: float = LOGOUT_TIMEOUT_S) -> None:
         """Give the session back (cameras allow only a few). Never raises."""
@@ -412,71 +429,124 @@ class CameraApi:
                            expect_json=False)
             except _NoAnswer:
                 pass
+            finally:
+                self._close_connection()
 
     # ------------------------------------------------------------- commands
 
     def _command(self, cmd: str, param: dict, action: int = 0, timeout: float = TIMEOUT_S) -> dict:
-        """Send one command and return its whole answer item, raising for errors."""
+        """Send one command and return its whole answer item, raising for errors.
+
+        An answer of "please login first" means the camera dropped the session (it
+        restarted, or the session ran out while the computer slept), or that it
+        doesn't take a token it has only just handed out yet. A fresh token is asked
+        with again after a pause or two; then the session is given back and renewed
+        once, which is safe: the camera has accepted this login. Nothing more.
+        """
         with self._lock:
+            if self._stuck_at and _now() - self._stuck_at < STUCK_RETRY_S:
+                raise ApiError(_STUCK)
             self.login()
             body = [{"cmd": cmd, "action": action, "param": param}]
-            for attempt in (1, 2):
+            renewed = False
+            pauses = list(FRESH_TOKEN_WAITS_S)
+            while True:
                 try:
                     answer = self._post(self._base, self._https, cmd, body, self._token, timeout)
                 except _NoAnswer as exc:
                     raise NotReachable(f"The camera stopped answering ({exc}).") from None
                 item = answer[0] if answer and isinstance(answer[0], dict) else {}
                 if item.get("code") == 0:
+                    if pauses != list(FRESH_TOKEN_WAITS_S) or renewed:
+                        log.info("[%s] the camera accepted the session for %s %.1f s after the login",
+                                 self.cam.name, cmd, _now() - self._login_at)
+                    self._stuck_at = 0.0
                     return item
                 code, detail = _error_of(item)
-                if code == _LOGIN_FIRST and attempt == 1:
-                    # The session ran out early. This login was accepted before, so
-                    # asking once more is safe; a refusal now is remembered as usual.
-                    self._token, self._token_expires = "", 0.0
-                    self.login()
+                if not _says_login_first(code, detail):
+                    if code in _NOT_SUPPORTED:
+                        raise NotSupported(f"This camera doesn't support that ({detail or cmd}).")
+                    raise ApiError(f"The camera answered with an error: {detail or f'code {code}'}.")
+                age = _now() - self._login_at
+                # The answer's cmd is "Unknown" if the camera couldn't read the request.
+                said = f"“{detail}” ({code}, cmd {item.get('cmd', '?')})"
+                if age < FRESH_TOKEN_S and pauses:
+                    pause = pauses.pop(0)
+                    log.warning("[%s] the camera refused %s with %s %.1f s after accepting the "
+                                "login: asking again in %.0f s", self.cam.name, cmd, said, age, pause)
+                    time.sleep(pause)
                     continue
-                if code in _NOT_SUPPORTED:
-                    raise NotSupported(f"This camera doesn't support that ({detail or cmd}).")
-                raise ApiError(f"The camera answered with an error: {detail or f'code {code}'}.")
-            raise ApiError("The camera keeps asking to log in again.")
+                if renewed:
+                    self._stuck_at = _now()
+                    log.warning("[%s] the camera refused %s with %s with a renewed session too "
+                                "(%.1f s after that login, over %s)", self.cam.name, cmd, said, age, self._base)
+                    raise ApiError(_STUCK)
+                renewed = True
+                log.warning("[%s] the camera refused %s with %s %.0f s after the login: "
+                            "renewing the session", self.cam.name, cmd, said, age)
+                self.logout()  # with its token: cameras allow only a few sessions
+                self.login()
+                pauses = list(FRESH_TOKEN_WAITS_S)
 
     def _post(self, base: str, https: bool, cmd: str, body: list, token: str,
               timeout: float, expect_json: bool = True) -> list:
-        url = f"{base}/cgi-bin/api.cgi?{urlencode({'cmd': cmd, 'token': token})}"
+        """Send one request on the session's kept-alive connection and return the answer.
+
+        A Login always goes on a new connection, and the commands after it on the
+        same one, as browsers and reolink_aio's HTTP client do: on new Reolink
+        firmware a token may only work on the connection it was handed out on.
+        Raises _NoAnswer when the request can't have reached the camera's API
+        (so another port or old TLS may be tried), _Unanswered when it may have.
+        """
+        path = f"/cgi-bin/api.cgi?{urlencode({'cmd': cmd, 'token': token})}"
         data = json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(
-            url, data=data, method="POST", headers={"Content-Type": "application/json"})
         modes = (self._legacy_tls,) if not https or self._legacy_tls else (False, True)
         last: Exception | None = None
         for legacy in modes:
-            opener = _opener(tls_context(legacy) if https else None)
             began = time.monotonic()
             try:
-                with opener.open(request, timeout=timeout) as response:
-                    raw = response.read(MAX_RESPONSE_BYTES)
-                    status, kind = response.status, response.headers.get("Content-Type", "?")
-            except urllib.error.HTTPError as exc:
-                # A server error may come after the request was handled; a redirect
-                # or "not found" means this isn't the camera's API.
-                kind = _Unanswered if exc.code >= 500 else _NoAnswer
-                raise kind(f"HTTP {exc.code}") from None
-            except urllib.error.URLError as exc:
-                # urllib wraps what fails while connecting and sending: nothing was
-                # delivered, so old TLS (or the next port) may be tried.
-                if isinstance(exc.reason, ssl.SSLError) and not legacy:
-                    last = exc
-                    continue
+                conn, reused = self._connection(base, https, legacy, timeout, fresh=cmd == "Login")
+            except ssl.SSLError as exc:
+                if legacy:
+                    raise _NoAnswer(_reason(exc)) from None
+                last = exc  # the handshake failed: nothing was sent, old TLS may work
+                continue
+            except (OSError, http.client.HTTPException, ValueError) as exc:
                 raise _NoAnswer(_reason(exc)) from None
+            try:
+                status, kind, raw = self._exchange(conn, path, data)
+            except _CLOSED as exc:
+                self._close_connection()
+                if not reused:
+                    raise _Unanswered(_reason(exc)) from None
+                # The camera closed the connection while it was idle. Once more on a
+                # new one (a command, never a Login: those always start a connection).
+                log.debug("[%s] API connection %d was closed by the camera (%s): opening another",
+                          self.cam.name, self._conn_number, _reason(exc))
+                try:
+                    conn, reused = self._connection(base, https, legacy, timeout, fresh=True)
+                except (OSError, http.client.HTTPException, ValueError) as again:
+                    raise _NoAnswer(_reason(again)) from None
+                try:
+                    status, kind, raw = self._exchange(conn, path, data)
+                except (OSError, http.client.HTTPException) as again:
+                    self._close_connection()
+                    raise _Unanswered(_reason(again)) from None
             except (OSError, http.client.HTTPException) as exc:
-                # Not wrapped: it failed after the request went out (no answer in
-                # time, the connection dropped, a broken TLS record, garbage back).
+                # It failed after the request went out (no answer in time, a broken
+                # TLS record, garbage back): the camera may have handled it.
+                self._close_connection()
                 raise _Unanswered(_reason(exc)) from None
-            except ValueError as exc:  # a malformed URL: nothing was sent
-                raise _NoAnswer(_reason(exc)) from None
             self._legacy_tls = legacy
             took = (time.monotonic() - began) * 1000
+            where = f"{base} (connection {self._conn_number}, request {self._conn_uses})"
+            if status != 200:
+                log.debug("[%s] API %s at %s: HTTP %s, %.0f ms", self.cam.name, cmd, where, status, took)
+                # A server error may come after the request was handled; a redirect
+                # (never followed) or "not found" means this isn't the camera's API.
+                raise (_Unanswered if status >= 500 else _NoAnswer)(f"HTTP {status}")
             if not expect_json:
-                log.debug("[%s] API %s at %s: HTTP %s, %.0f ms", self.cam.name, cmd, base, status, took)
+                log.debug("[%s] API %s at %s: HTTP %s, %.0f ms", self.cam.name, cmd, where, status, took)
                 return []
             text = raw.decode("utf-8", "replace")
             try:
@@ -485,14 +555,53 @@ class CameraApi:
                 answer = None
             if not isinstance(answer, list):
                 log.debug("[%s] API %s at %s: HTTP %s (%s), %d bytes that aren't an API answer, %.0f ms",
-                          self.cam.name, cmd, base, status, kind, len(raw), took)
+                          self.cam.name, cmd, where, status, kind, len(raw), took)
                 # A cut-off answer from the camera, or some other web server's page.
                 fault = _Unanswered if answer is None and text.lstrip()[:1] in ("[", "{") else _NoAnswer
                 raise fault("not a Reolink API answer")
-            log.debug("[%s] API %s at %s: HTTP %s (%s), %s, %.0f ms", self.cam.name, cmd, base, status, kind,
+            log.debug("[%s] API %s at %s: HTTP %s (%s), %s, %.0f ms", self.cam.name, cmd, where, status, kind,
                       _summary(cmd, answer), took)
             return answer
         raise _NoAnswer(_reason(last) if last else "TLS handshake failed")
+
+    def _connection(self, base: str, https: bool, legacy: bool, timeout: float,
+                    fresh: bool) -> tuple[http.client.HTTPConnection, bool]:
+        """(the connection to use, whether it served a request before). Connects a
+        new one if asked to or if there is none for this address and TLS mode."""
+        key = (base, legacy)
+        conn = self._conn
+        if not fresh and conn is not None and conn.sock is not None and self._conn_key == key:
+            conn.sock.settimeout(timeout)
+            return conn, True
+        self._close_connection()
+        address = urlsplit(base)
+        if https:
+            conn = http.client.HTTPSConnection(address.hostname, address.port, timeout=timeout,
+                                               context=tls_context(legacy))
+        else:
+            conn = http.client.HTTPConnection(address.hostname, address.port, timeout=timeout)
+        conn.connect()  # TCP and TLS: what fails here never reached the API
+        self._conn, self._conn_key = conn, key
+        self._conn_number += 1
+        self._conn_uses = 0
+        return conn, False
+
+    def _exchange(self, conn: http.client.HTTPConnection, path: str, data: bytes) -> tuple[int, str, bytes]:
+        """POST on the connection and read the whole answer (so the connection can
+        serve the next request): (HTTP status, content type, body)."""
+        self._conn_uses += 1
+        conn.request("POST", path, body=data, headers={
+            "Content-Type": "application/json", "User-Agent": USER_AGENT, "Connection": "keep-alive"})
+        response = conn.getresponse()
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if response.will_close or len(raw) > MAX_RESPONSE_BYTES or not response.isclosed():
+            self._close_connection()  # the camera ends it, or the rest wasn't read
+        return response.status, response.getheader("Content-Type", "?"), raw[:MAX_RESPONSE_BYTES]
+
+    def _close_connection(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     # ----------------------------------------------------------- recordings
 

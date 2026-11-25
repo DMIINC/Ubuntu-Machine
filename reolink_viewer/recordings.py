@@ -142,14 +142,32 @@ def _address(session: api.CameraApi, rec: api.Recording) -> tuple[str, vod.Probe
     lock, and only if nobody else has since.
     """
     url = session.playback_url(rec)
-    probe = vod.probe(url)
-    if not probe.ok and probe.kind == "camera" and "login" in probe.text.lower():
+    probe = _probe(session, url)
+    if _login_refused(probe):
         session.forget_token(url)
         fresh = session.playback_url(rec)
         if fresh != url:
             log.info("[%s] the camera dropped the session: asking again with a new one", session.cam.name)
-            url, probe = fresh, vod.probe(fresh)
+            url, probe = fresh, _probe(session, fresh)
     return url, probe
+
+
+def _login_refused(probe: vod.Probe) -> bool:
+    return not probe.ok and probe.kind == "camera" and "login" in probe.text.lower()
+
+
+def _probe(session: api.CameraApi, url: str) -> vod.Probe:
+    """vod.probe, but a token the camera handed out only just now gets a moment
+    to take effect, as in api.CameraApi._command."""
+    probe = vod.probe(url)
+    for pause in api.FRESH_TOKEN_WAITS_S:
+        if not (_login_refused(probe) and session.token_is_fresh(url)):
+            break
+        log.warning("[%s] the camera refused a session it had just opened: asking again in %.0f s",
+                    session.cam.name, pause)
+        time.sleep(pause)
+        probe = vod.probe(url)
+    return probe
 
 
 def _disk_problem(exc: Exception) -> str:

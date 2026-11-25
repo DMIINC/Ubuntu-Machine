@@ -457,3 +457,106 @@ def test_nvr_clips_are_asked_for_by_their_playback_time():
         rec = session.recordings(date(2023, 4, 17))[0]
         assert rec.playback_start == "20230416235957"
         assert "&start=20230416235957&" in session.playback_url(rec)
+
+
+@pytest.fixture
+def short_waits(monkeypatch):
+    monkeypatch.setattr(api, "FRESH_TOKEN_WAITS_S", (0.2, 0.4))
+
+
+def test_a_token_the_camera_takes_a_moment_to_accept_is_waited_for(short_waits):
+    with FakeCamera() as fake:
+        fake.token_settle_s = 0.3
+        fake.add_clips(clip(datetime(2026, 11, 24, 8)))
+        session = client(fake)
+        assert session.recording_days(2026, 11) == [24]
+        assert fake.login_attempts == 1  # no new session for it
+        assert fake.commands.count("Search") >= 2
+
+
+def test_a_camera_that_refuses_every_token_gets_one_renewal_then_an_explanation(short_waits):
+    with FakeCamera() as fake:
+        fake.stuck = True
+        session = client(fake)
+        began = time.monotonic()
+        with pytest.raises(ApiError, match="please login first.*restart"):
+            session.recording_days(2026, 11)
+        assert fake.login_attempts == 2  # the first login and one renewal: both accepted
+        assert len(fake.tokens) == 1  # the refused session was given back first
+        assert fake.commands.count("Logout") == 1
+        assert time.monotonic() - began < 3
+        # Asked again at once, it says the same without bothering the camera.
+        asked = len(fake.commands)
+        with pytest.raises(ApiError, match="please login first"):
+            session.recordings(date(2026, 11, 24))
+        assert len(fake.commands) == asked
+        # Once the camera is back to normal (restarted), the next try works.
+        fake.stuck = False
+        session._stuck_at -= api.STUCK_RETRY_S
+        assert session.recording_days(2026, 11) == []
+        assert fake.login_attempts == 2
+
+
+def test_a_session_dropped_long_after_the_login_is_renewed_without_waiting(short_waits, monkeypatch):
+    with FakeCamera() as fake:
+        session = client(fake)
+        session.login()
+        session._login_at -= api.FRESH_TOKEN_S  # an old session
+        fake.tokens.clear()  # that the camera forgot (it restarted)
+        began = time.monotonic()
+        assert session.recording_days(2026, 11) == []
+        assert time.monotonic() - began < 0.2 and fake.login_attempts == 2
+
+
+def test_the_log_shows_each_answer_without_the_token(caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="reolink_viewer.api")
+    with FakeCamera() as fake:
+        session = client(fake)
+        session.recording_days(2026, 11)
+        assert "API Login at http://127.0.0.1" in caplog.text and "token given, lease 3600" in caplog.text
+        assert "API Search at" in caplog.text and "code 0" in caplog.text
+        assert not any(token in caplog.text for token in fake.tokens)
+
+
+def test_the_login_and_the_commands_after_it_share_one_connection():
+    with FakeCamera() as fake:
+        session = client(fake)
+        session.recording_days(2026, 11)
+        session.zoom_focus()
+        ports = {port for port, _what in fake.requests}
+        assert len(ports) == 1, fake.requests
+        assert [what for _port, what in fake.requests][0] == "Login"
+        # As browsers and aiohttp send it: no port in the Host header for the default
+        # port (here the fake's own port, so it's there).
+        assert all(host == f"127.0.0.1:{fake.port}" for host in fake.hosts)
+
+
+def test_a_camera_that_binds_tokens_to_their_connection_works():
+    with FakeCamera() as fake:
+        fake.bind_tokens = True
+        fake.add_clips(clip(datetime(2026, 11, 24, 8)))
+        session = client(fake)
+        assert session.recording_days(2026, 11) == [24]
+        assert len(session.recordings(date(2026, 11, 24))) == 1
+        assert fake.login_attempts == 1
+
+
+def test_a_connection_the_camera_closed_is_replaced_without_a_new_login():
+    with FakeCamera() as fake:
+        fake.close_connections = True  # no keep-alive, and no "Connection: close" said either
+        session = client(fake)
+        assert session.recording_days(2026, 11) == []
+        assert session.recording_days(2026, 10) == []
+        session.zoom_focus()
+        assert fake.login_attempts == 1
+        assert fake.commands.count("Search") == 2  # each sent once
+
+
+def test_logout_closes_the_connection():
+    with FakeCamera() as fake:
+        session = client(fake)
+        session.login()
+        session.logout()
+        assert session._conn is None and fake.tokens == set()
