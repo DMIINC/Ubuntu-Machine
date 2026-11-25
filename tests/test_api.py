@@ -482,8 +482,7 @@ def test_a_camera_that_refuses_every_token_gets_one_renewal_then_an_explanation(
         with pytest.raises(ApiError, match="please login first.*restart"):
             session.recording_days(2026, 11)
         assert fake.login_attempts == 2  # the first login and one renewal: both accepted
-        assert len(fake.tokens) == 1  # the refused session was given back first
-        assert fake.commands.count("Logout") == 1
+        assert fake.commands.count("Logout") == 0  # never for a session the camera refused
         assert time.monotonic() - began < 3
         # Asked again at once, it says the same without bothering the camera.
         asked = len(fake.commands)

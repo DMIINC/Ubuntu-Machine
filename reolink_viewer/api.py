@@ -400,15 +400,23 @@ class CameraApi:
 
     def forget_token(self, url_or_token: str) -> bool:
         """The camera refused a playback URL with "please login first" (it restarted,
-        or the session ran out while the computer slept). Give that session back
-        and drop it, so the next playback_url() logs in afresh, which is safe: this
-        login was accepted. Only the token in question is dropped, so two clips
+        or the session ran out while the computer slept). Drop that session (without
+        a Logout, see _drop_session), so the next playback_url() logs in afresh,
+        which is safe: this login was accepted. Only the token in question is dropped, so two clips
         refused at once cause one new login. Returns whether it was still the current one."""
         with self._lock:
             if self._token and self._token in url_or_token:
-                self.logout()
+                self._drop_session()
                 return True
             return False
+
+    def _drop_session(self) -> None:
+        """Forget a session the camera has refused, without a Logout: the camera
+        has no use for one it doesn't take, and reolink_aio notes that a Logout
+        some firmware can't match to a session leaves every later token refused
+        until the camera restarts."""
+        self._token, self._token_expires = "", 0.0
+        self._close_connection()
 
     def token_is_fresh(self, url_or_token: str) -> bool:
         """Whether this is the current token and the camera handed it out only just now."""
@@ -440,8 +448,9 @@ class CameraApi:
         An answer of "please login first" means the camera dropped the session (it
         restarted, or the session ran out while the computer slept), or that it
         doesn't take a token it has only just handed out yet. A fresh token is asked
-        with again after a pause or two; then the session is given back and renewed
-        once, which is safe: the camera has accepted this login. Nothing more.
+        with again after a pause or two; then the session is dropped (no Logout, see
+        _drop_session) and renewed once, which is safe: the camera has accepted this
+        login. Nothing more.
         """
         with self._lock:
             if self._stuck_at and _now() - self._stuck_at < STUCK_RETRY_S:
@@ -484,7 +493,7 @@ class CameraApi:
                 renewed = True
                 log.warning("[%s] the camera refused %s with %s %.0f s after the login: "
                             "renewing the session", self.cam.name, cmd, said, age)
-                self.logout()  # with its token: cameras allow only a few sessions
+                self._drop_session()
                 self.login()
                 pauses = list(FRESH_TOKEN_WAITS_S)
 
