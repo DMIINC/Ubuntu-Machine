@@ -54,6 +54,9 @@ class Camera:
     audio: bool = False
     custom_url: str = ""
     uid: str = ""  # battery cameras: the UID from the Reolink app's Device Info
+    # Port of the camera's web interface (recordings, zoom and focus);
+    # 0 = try HTTPS on 443, then HTTP on 80.
+    api_port: int = 0
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     @classmethod
@@ -171,6 +174,10 @@ def build_url(cam: Camera, stream: str | None = None) -> str:
     raise ValueError(f"Unknown protocol: {proto}")
 
 
+# URL query keys whose value opens the camera: a password or a session token.
+_SECRET_KEYS = ("password", "pass", "pwd", "passwd", "token")
+
+
 def redact_url(url: str) -> str:
     """Hide passwords in a URL so it is safe to show in the UI or logs."""
     try:
@@ -187,7 +194,7 @@ def redact_url(url: str) -> str:
         pairs = []
         for item in query.split("&"):
             key, sep, _ = item.partition("=")
-            pairs.append(f"{key}=***" if key.lower() in ("password", "pass", "pwd") else item)
+            pairs.append(f"{key}=***" if key.lower() in _SECRET_KEYS else item)
         query = "&".join(pairs)
     return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
 

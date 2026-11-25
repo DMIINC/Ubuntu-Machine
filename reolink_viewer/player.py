@@ -29,8 +29,35 @@ WATCHDOG_INTERVAL_S = 5
 # may stream before it goes back to sleep. Each minute awake costs battery.
 WAKE_TIMEOUT_S = 60
 AWAKE_LIMIT_S = 5 * 60
-NEOLINK_TIMEOUT_US = 10_000_000  # rtspsrc gives up on an unanswered request (default 20 s)
+# Once neolink serves the stream the camera is awake; what remains is neolink's
+# own start-up, which gets this long before the tile gives up.
+WAKE_CONNECT_S = 45
+WAKE_POLL_MS = 100
+# rtspsrc gives up on an unanswered request after this. Longer than the 20 s
+# neolink's RTSP server waits before it answers 503: a request abandoned earlier
+# is still carried out by the server later, for nobody, with every other client
+# waiting behind it.
+NEOLINK_TIMEOUT_US = 25_000_000
+RETRY_AFTER_503_MS = 50  # a 503 means the server has just become free again
 ASLEEP = "Asleep · double-click to view"
+LOGIN_REJECTED = "Login rejected: check the password (right-click → Edit…)"
+# rtspsrc's progress messages, as steps of a battery camera's wake timeline.
+_PROGRESS = {
+    "Retrieving media info": "options ok",
+    "Opened Stream": "setup ok",
+    "Sent PLAY request": "play ok",
+}
+
+
+def _error_reason(err: GLib.Error, debug: str | None) -> str:
+    """Short reason for the wake timeline: "503", "400", "timeout" or the message."""
+    debug = debug or ""
+    for code in ("503", "400", "404", "401"):
+        if f"({code})" in debug:
+            return code
+    if "Timeout" in debug:
+        return "timeout"
+    return err.message
 
 
 # Video output paths, best first. Each one that fails is skipped from then on:
@@ -57,13 +84,13 @@ def configure(gpu_only: bool) -> None:
     """Apply GPU-only mode. Call once after Gst.init(), before creating tiles."""
     global GPU_ONLY
     GPU_ONLY = gpu_only
+    if not gpu_only:
+        return
     for factory in Gst.Registry.get().get_feature_list(Gst.ElementFactory):
         klass = factory.get_metadata("klass") or ""
         if "Decoder/Video" in klass and "Hardware" not in klass:
-            if gpu_only:
-                factory.set_rank(Gst.Rank.NONE)
-    if gpu_only:
-        log.info("GPU-only mode: software video decoders disabled")
+            factory.set_rank(Gst.Rank.NONE)
+    log.info("GPU-only mode: software video decoders disabled")
 
 
 _cpu_sample = (time.monotonic(), time.process_time())
@@ -132,15 +159,21 @@ class FramePacer:
         self._arrivals: dict[int, float] = {}
         self._next: float | None = None
         self._gap_peak = 0.0
+        self._first = True  # the next frame is the first of a connection
         self._wake = threading.Event()
         queue.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_arrive)
         queue.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._on_release)
 
-    def reset(self) -> None:
-        """Forget the schedule (on (re)connect); the learned frame rate is kept."""
+    def reset(self, new_stream: bool = False) -> None:
+        """Forget the schedule (on (re)connect). The learned frame rate is kept,
+        unless another stream is about to play: its rate differs. The cushion is
+        kept either way, it reflects the camera and its network."""
         self._next = None
         self._last_arrival = None
         self._arrivals.clear()
+        self._first = True
+        if new_stream:
+            self._interval = None
         self._wake.clear()
 
     @property
@@ -168,6 +201,12 @@ class FramePacer:
     def _on_release(self, _pad, info):
         now = time.monotonic()
         arrived = self._arrivals.pop(info.get_buffer().pts, now)
+        if self._first:
+            # Show the first picture of a connection at once instead of holding it
+            # for the cushion (0.6-0.75 s on a bursty camera). Motion starts when
+            # it would have anyway: the next frame opens the schedule.
+            self._first = False
+            return Gst.PadProbeReturn.OK
         cushion = self.cushion
         if now - arrived > cushion + self.EXTRA_LAG:
             self._next = None
@@ -341,14 +380,27 @@ class CameraTile(Gtk.EventBox):
     def __init__(self, camera: Camera,
                  wake: Callable[[Camera, str], str | None] | None = None,
                  sleep: Callable[[Camera], None] | None = None,
-                 ready: Callable[[Camera], bool] | None = None):
+                 ready: Callable[[Camera], bool] | None = None,
+                 note: Callable[[Camera, str], None] | None = None,
+                 stage: Callable[[Camera], str] | None = None):
         super().__init__()
         self.camera = camera
         # Battery cameras: wake(camera, stream) returns why it can't, or None;
-        # ready(camera) says whether its stream can be connected to yet.
+        # ready(camera) says whether its stream can be connected to yet;
+        # note(camera, step) records a step of the wake for its timeline, and
+        # stage(camera) says how far the wake has got.
         self._wake = wake
         self._sleep = sleep
         self._ready = ready
+        self._note = note
+        self._stage = stage
+        self._attempt = 0  # connection attempts since start()
+        self._last_error = ""
+        self._stream_up = False  # battery camera: neolink has served its stream in this wake
+        self._last_uri = ""
+        self._connect_started = 0.0
+        self._notice = ""  # a passing message shown in the caption
+        self._notice_id = 0
         self.stream_override: str | None = None
         # The balanced stream comes over RTMP, which a camera may have turned off.
         self._ext_worked = False
@@ -360,6 +412,9 @@ class CameraTile(Gtk.EventBox):
         self._got_frame = False
         self._awake_since = 0.0
         self._wake_deadline = 0.0  # battery cameras: give up waking after this
+        # The camera refused the login. Not tried again until the user edits the
+        # camera or asks to reconnect: every refusal counts toward its lockout.
+        self._login_rejected = False
         self._status = self._idle_status()
 
         # Let the event box receive clicks on top of the video widget.
@@ -406,14 +461,32 @@ class CameraTile(Gtk.EventBox):
         return self._wanted
 
     def set_camera(self, camera: Camera) -> None:
-        """Replace the camera settings (after editing) and restart if running."""
+        """Replace the camera settings (after editing). Restarts a running tile only
+        if what it plays changed: a rename must not cost a reconnect and a login."""
+        old = self.camera
+        was_rejected = self._login_rejected
         self.camera = camera
+        same_login = (old.host, old.username, old.password) == (
+            camera.host, camera.username, camera.password)
+        if self._plays_the_same(old, camera) and same_login:
+            self._update_label()
+            return
         self._ext_worked = self._ext_unavailable = False
+        self._login_rejected = False  # an edited camera is worth one more try
         self._apply_audio_flag()
-        if self._wanted:
+        if self._wanted or (was_rejected and not camera.on_demand):
             self.restart()
         else:
             self._set_status(self._idle_status())
+
+    def _plays_the_same(self, old: Camera, new: Camera) -> bool:
+        if (old.audio, old.protocol, old.uid) != (new.audio, new.protocol, new.uid):
+            return False
+        try:
+            stream = self.wanted_stream
+            return old.url(resolve_stream(old, stream)) == new.url(resolve_stream(new, stream))
+        except ValueError:
+            return False
 
     def set_stream_override(self, stream: str | None) -> None:
         if stream == self.stream_override:
@@ -427,8 +500,15 @@ class CameraTile(Gtk.EventBox):
 
     def start(self) -> None:
         """Start playing; for a battery camera, wake it."""
+        if self._login_rejected:
+            return  # only reconnect() or an edit tries that login again
         self._awake_since = time.monotonic()
         self._wake_deadline = self._awake_since + WAKE_TIMEOUT_S if self.camera.on_demand else 0.0
+        self._backoff = RETRY_MIN_S
+        self._attempt = 0
+        self._stream_up = False
+        if self.camera.on_demand and self._note:
+            self._note(self.camera, "wake")
         self._connect()
 
     def _connect(self) -> None:
@@ -459,9 +539,21 @@ class CameraTile(Gtk.EventBox):
                 if not rtmp_safe(self.camera) else ", which failed",
             )
         log.info("[%s] connecting to %s", self.camera.name, self.camera.display_url(self.active_stream))
+        self._attempt += 1
+        self._connect_started = time.monotonic()
+        if self.camera.on_demand:
+            if not self._stream_up:
+                # The camera is awake: from here on it's neolink's start-up that takes time.
+                self._stream_up = True
+                self._wake_deadline = max(self._wake_deadline, self._connect_started + WAKE_CONNECT_S)
+            if self._note:
+                self._note(self.camera, f"connect#{self._attempt}")
         self._stop_pipeline()
         if self._sink_stale and not self._replace_stale_sink():
             return
+        if uri != self._last_uri and self._sink.pacer is not None:
+            self._sink.pacer.reset(new_stream=True)
+        self._last_uri = uri
         self._playbin.set_property("uri", uri)
         self._set_status("Waking camera…" if self.camera.on_demand else "Connecting…")
         if self._playbin.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -481,44 +573,68 @@ class CameraTile(Gtk.EventBox):
         self._set_status(status or self._idle_status())
 
     def restart(self) -> None:
-        self._backoff = RETRY_MIN_S
         self.start()
 
     def reconnect(self) -> None:
-        """Reconnect on request, trying the balanced stream again if it failed."""
+        """Reconnect because the user asked: tries the balanced stream again if it
+        had failed, and a login the camera had refused (once)."""
         self._ext_unavailable = False
+        self._login_rejected = False
         self.restart()
 
-    def snapshot_png(self) -> bytes | None:
-        """Return the current frame as PNG bytes, or None if nothing is playing."""
+    def flash(self, text: str, seconds: int = 4) -> None:
+        """Show a passing message in the caption (e.g. where a snapshot went)."""
+        if self._notice_id:
+            GLib.source_remove(self._notice_id)
+        self._notice = text
+        self._notice_id = GLib.timeout_add_seconds(seconds, self._clear_notice)
+        self._update_label()
+
+    def _clear_notice(self) -> bool:
+        self._notice, self._notice_id = "", 0
+        self._update_label()
+        return False
+
+    def snapshot_png(self, done: Callable[[bytes | None], None]) -> None:
+        """Convert the current frame to PNG off the GTK thread (a 4K frame takes up
+        to a couple of seconds), then call done(png bytes, or None if there's no
+        frame or it failed) on the GTK thread."""
         buf = self._last_buffer
         caps = self._sink.element.get_static_pad("sink").get_current_caps() if self._sink else None
         if buf is None or caps is None:
-            return None
+            done(None)
+            return
         caps = caps.copy()
         caps.set_features(0, Gst.CapsFeatures.new_empty())
-        try:
-            png = GstVideo.video_convert_sample(
-                Gst.Sample.new(buf, caps, None, None),
-                Gst.Caps.from_string("image/png"),
-                5 * Gst.SECOND,
-            )
-        except GLib.Error as exc:
-            log.warning("[%s] snapshot failed: %s", self.camera.name, exc.message)
-            return None
-        buf = png.get_buffer()
-        ok, info = buf.map(Gst.MapFlags.READ)
-        if not ok:
-            return None
-        try:
-            return bytes(info.data)
-        finally:
-            buf.unmap(info)
+        name = self.camera.name
+
+        def converted(sample, error) -> None:
+            if sample is None:
+                log.warning("[%s] snapshot failed: %s", name, error.message if error else "no picture")
+                done(None)
+                return
+            png = sample.get_buffer()
+            ok, info = png.map(Gst.MapFlags.READ)
+            if not ok:
+                done(None)
+                return
+            try:
+                data = bytes(info.data)
+            finally:
+                png.unmap(info)
+            done(data)
+
+        GstVideo.video_convert_sample_async(
+            Gst.Sample.new(buf, caps, None, None), Gst.Caps.from_string("image/png"),
+            5 * Gst.SECOND, converted)
 
     def dispose(self) -> None:
         if self._watchdog_id:
             GLib.source_remove(self._watchdog_id)
             self._watchdog_id = 0
+        if self._notice_id:
+            GLib.source_remove(self._notice_id)
+            self._notice_id = 0
         self._wanted = False
         self._cancel_retry()
         if self._playbin is not None:
@@ -569,7 +685,11 @@ class CameraTile(Gtk.EventBox):
     def _stop_pipeline(self) -> None:
         if self._sink is not None and self._sink.pacer is not None:
             self._sink.pacer.interrupt()
+        began = time.monotonic()
         self._playbin.set_state(Gst.State.NULL)
+        took = time.monotonic() - began
+        if took > 0.05:  # this runs on the GTK thread: the window was frozen that long
+            log.debug("[%s] stopping the stream took %.0f ms", self.camera.name, took * 1000)
         if self._sink is not None and self._sink.pacer is not None:
             self._sink.pacer.reset()
 
@@ -678,12 +798,28 @@ class CameraTile(Gtk.EventBox):
             # Reolink RTSP over UDP drops lots of packets; TCP is far more reliable.
             source.set_property("latency", RTSP_LATENCY_MS)
             Gst.util_set_object_arg(source, "protocols", "tcp")
+            if source.find_property("teardown-timeout") is not None:
+                # Don't wait for the camera to acknowledge a stop: that wait (up to
+                # 100 ms per tile, one after another) froze the window on every
+                # maximize, restore and quit. Closing the connection ends the session.
+                source.set_property("teardown-timeout", 0)
             if self.camera.on_demand:
-                # neolink sometimes never answers a battery camera's first
-                # connection; a retry usually works within seconds.
                 source.set_property("tcp-timeout", NEOLINK_TIMEOUT_US)
+                source.connect("on-sdp", self._on_sdp)
         elif name in ("souphttpsrc",):
             source.set_property("is-live", True)
+
+    def _on_sdp(self, _source, _sdp) -> None:
+        # Runs on rtspsrc's thread: neolink answered DESCRIBE (its media has data).
+        GLib.idle_add(self._step, "sdp")
+
+    def _step(self, what: str) -> bool:
+        """A battery camera's connection got one step further."""
+        if self._wanted:
+            self._last_frame = time.monotonic()  # the server is answering: not stalled
+            if self._note:
+                self._note(self.camera, what)
+        return False
 
     def _on_buffer(self, _pad, info):
         # Runs on a streaming thread: only touch simple attributes here.
@@ -699,6 +835,10 @@ class CameraTile(Gtk.EventBox):
         if self._wanted:
             self._backoff = RETRY_MIN_S
             self._wake_deadline = 0.0
+            log.debug("[%s] first picture %.2f s after connecting (attempt %d)", self.camera.name,
+                      time.monotonic() - self._connect_started, self._attempt)
+            if self.camera.on_demand and self._note:
+                self._note(self.camera, "first frame")
             if self.active_stream == "ext":
                 self._ext_worked = True
             self._set_status("Live")
@@ -708,6 +848,15 @@ class CameraTile(Gtk.EventBox):
         if msg.type == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
             log.warning("[%s] error: %s (%s)", self.camera.name, err.message, debug)
+            self._last_error = _error_reason(err, debug)
+            if self.camera.on_demand and self._note:
+                self._note(self.camera, f"failed: {self._last_error}")
+            if err.matches(Gst.ResourceError.quark(), Gst.ResourceError.NOT_AUTHORIZED):
+                # Wrong user name or password. Retrying would repeat the failed
+                # login every few seconds until the camera locks the account.
+                self._login_rejected = True
+                self.stop(LOGIN_REJECTED)
+                return
             if (self._sink.kind != "cpu" or GPU_ONLY) and (
                 self._sink.contains(msg.src)
                 or (not self._got_frame and "not-negotiated" in (debug or ""))
@@ -729,6 +878,10 @@ class CameraTile(Gtk.EventBox):
                 # rtspsrc's "Could not open resource for reading and writing."
                 reason = "Can't connect (offline? RTSP off? battery camera: Edit → Protocol)"
             self._schedule_reconnect(reason)
+        elif msg.type == Gst.MessageType.PROGRESS and self.camera.on_demand:
+            text = msg.parse_progress()[2]
+            if text in _PROGRESS:
+                self._step(_PROGRESS[text])
         elif msg.type == Gst.MessageType.EOS:
             log.info("[%s] end of stream", self.camera.name)
             self._schedule_reconnect("Stream ended")
@@ -777,13 +930,16 @@ class CameraTile(Gtk.EventBox):
                      self.camera.name, AWAKE_LIMIT_S // 60)
             self.stop(f"Asleep after {AWAKE_LIMIT_S // 60} min (battery) · double-click to view")
             return True
-        if (
-            self._wanted
-            and not self._retry_id
-            and time.monotonic() - self._last_frame > STALL_TIMEOUT_S
-        ):
+        quiet = time.monotonic() - self._last_frame
+        if self._wanted and not self._retry_id and quiet > STALL_TIMEOUT_S:
             log.warning("[%s] no frames for %ss, reconnecting", self.camera.name, STALL_TIMEOUT_S)
+            if self.camera.on_demand and self._note:
+                self._note(self.camera, f"no video for {STALL_TIMEOUT_S} s")
             self._schedule_reconnect("No video")
+        elif self._wanted and self._got_frame and not self._retry_id and quiet > 2 * WATCHDOG_INTERVAL_S:
+            self._set_status(f"No new picture for {quiet:.0f} s")  # don't call a frozen picture live
+        elif self._status.startswith("No new picture") and quiet < WATCHDOG_INTERVAL_S:
+            self._set_status("Live")
         return True
 
     def _schedule_reconnect(self, reason: str) -> None:
@@ -799,14 +955,17 @@ class CameraTile(Gtk.EventBox):
             if not self._wake_deadline:
                 self._wake_deadline = now + WAKE_TIMEOUT_S
             if now > self._wake_deadline:
-                log.warning("[%s] didn't wake: %s", self.camera.name, reason)
-                self.stop("Camera didn't wake (UID, Wi-Fi?) · double-click to try again")
+                self._give_up(self._last_error or reason)
                 return
-            delay = 1
-            reason = "Waking camera…"
-        else:
-            delay = self._backoff
-            self._backoff = min(self._backoff * 2, RETRY_MAX_S)
+            # After a 503 neolink's server has just become free: go at once. A 400
+            # means it isn't ready, so don't hammer it.
+            delay_ms = RETRY_AFTER_503_MS if self._last_error == "503" else 1000
+            self._last_error = ""
+            self._set_status(self._waking_status())
+            self._retry_id = GLib.timeout_add(delay_ms, self._on_retry)
+            return
+        delay = self._backoff
+        self._backoff = min(self._backoff * 2, RETRY_MAX_S)
         self._set_status(f"{reason} — retrying in {delay}s")
         self._retry_id = GLib.timeout_add_seconds(delay, self._on_retry)
 
@@ -816,11 +975,26 @@ class CameraTile(Gtk.EventBox):
         if not self._wake_deadline:
             self._wake_deadline = time.monotonic() + WAKE_TIMEOUT_S
         if time.monotonic() > self._wake_deadline:
-            log.warning("[%s] didn't wake within %ss", self.camera.name, WAKE_TIMEOUT_S)
-            self.stop("Camera didn't wake (UID, Wi-Fi?) · double-click to try again")
+            self._give_up(f"not ready within {WAKE_TIMEOUT_S} s")
             return
-        self._set_status("Waking camera…")
-        self._retry_id = GLib.timeout_add(500, self._on_retry)
+        self._set_status(self._waking_status())
+        self._retry_id = GLib.timeout_add(WAKE_POLL_MS, self._on_retry)
+
+    def _waking_status(self) -> str:
+        stage = self._stage(self.camera) if self._stage else ""
+        if self._stream_up:
+            stage = "starting video"
+        return f"Waking camera… ({stage})" if stage else "Waking camera…"
+
+    def _give_up(self, reason: str) -> None:
+        """Stop waking a battery camera: each minute awake costs it battery."""
+        log.warning("[%s] gave up waking: %s", self.camera.name, reason)
+        if self._note:
+            self._note(self.camera, f"gave up ({reason})")
+        if self._stream_up:
+            self.stop("Camera is awake, but no video came · double-click to try again")
+        else:
+            self.stop("Camera didn't wake (UID, Wi-Fi?) · double-click to try again")
 
     def _on_retry(self) -> bool:
         self._retry_id = 0
@@ -834,6 +1008,8 @@ class CameraTile(Gtk.EventBox):
             self._retry_id = 0
 
     def _idle_status(self) -> str:
+        if self._login_rejected:
+            return LOGIN_REJECTED
         return ASLEEP if self.camera.on_demand else "Stopped"
 
     def _set_status(self, status: str) -> None:
@@ -843,7 +1019,7 @@ class CameraTile(Gtk.EventBox):
     def _update_label(self) -> None:
         stream = self.active_stream if self.camera.protocol != "custom" else "custom"
         stream = "balanced" if stream == "ext" else stream
-        text = f"{self.camera.name}  ·  {stream}  ·  {self._status}"
+        text = f"{self.camera.name}  ·  {stream}  ·  {self._notice or self._status}"
         self._label.set_text(text)
         try:
             self.set_tooltip_text(self.camera.display_url(self.active_stream))

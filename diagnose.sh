@@ -3,7 +3,7 @@
 # Output goes to the screen and to ~/reolink-diagnose.txt. Passwords are masked.
 HERE="$(dirname "$(readlink -f "$0")")"
 OUT="$HOME/reolink-diagnose.txt"
-mask() { sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#g; s#(password=)[^& ]*#\1***#g'; }
+mask() { sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#g; s#((password|token)=)[^& ]*#\1***#g'; }
 
 {
 echo "=== System"
@@ -18,6 +18,8 @@ for e in vah264dec vah265dec vaapih264dec vaapih265dec nvh264dec nvh265dec avdec
 done
 NEOLINK="$(PYTHONPATH="$HERE" /usr/bin/python3 -c 'from reolink_viewer.neolink import find_binary; print(find_binary() or "")')"
 echo; echo "neolink (battery cameras): ${NEOLINK:-not installed}${NEOLINK:+ ($("$NEOLINK" --version 2>/dev/null | tail -1))}"
+SHIM="$(PYTHONPATH="$HERE" /usr/bin/python3 -c 'import sys; from reolink_viewer.neolink import find_shim; print(find_shim(sys.argv[1] or None) or "")' "$NEOLINK")"
+echo "battery wake speed-up library: ${SHIM:-not built (install.sh builds it; needs gcc)}"
 command -v vainfo >/dev/null && { echo; echo "=== vainfo"; vainfo 2>&1 | grep -E "Driver version|VAProfileH26[45]|error" | head -12; }
 
 mapfile -t CAMS < <(PYTHONPATH="$HERE" /usr/bin/python3 -c '
@@ -50,7 +52,7 @@ for line in "${CAMS[@]}"; do
     done
 done
 
-APP_FILTER="fps shown|decoder|decoded video|output|error|WARNING|GPU-only"
+APP_FILTER="fps shown|decoder|decoded video|output|error|WARNING|GPU-only|frozen|first picture|stopping the stream"
 echo; echo "=== App run (40s, window will open)"
 # Match the desktop launcher: terminals inside some apps export GDK_BACKEND.
 env -u GDK_BACKEND timeout 40 "$HERE/reolink-viewer" -v 2>&1 | grep -E "$APP_FILTER" | tail -30 | mask

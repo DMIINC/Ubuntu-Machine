@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import logging
 import math
 import sys
@@ -25,9 +26,9 @@ from .config import (  # noqa: E402
     load_settings,
     save_settings,
 )
+from . import api, player  # noqa: E402
 from .dialogs import CameraDialog  # noqa: E402
 from .neolink import Neolink  # noqa: E402
-from . import player  # noqa: E402
 from .player import CameraTile  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -132,18 +133,18 @@ class MainWindow(Gtk.ApplicationWindow):
             cells = {tile: (i, 0) for i, tile in enumerate(shown)}
         else:
             cells = {tile: (i % cols, i // cols) for i, tile in enumerate(tiles)}
-        # Tiles are only re-attached when their cell changes: re-attaching re-creates
-        # the video widget's window, and the tile then has to rebuild its output.
+        # A tile already in the grid is moved in place, never taken out and put
+        # back: that re-creates the video widget's window, and the tile then has to
+        # rebuild its output and connect (and log in) again.
         for tile in tiles:
             cell = cells.get(tile)
             if cell is None:
                 continue
             if tile.get_parent() is self.grid:
-                if cell == (self.grid.child_get_property(tile, "left-attach"),
-                            self.grid.child_get_property(tile, "top-attach")):
-                    continue
-                self.grid.remove(tile)
-            self.grid.attach(tile, *cell, 1, 1)
+                self.grid.child_set_property(tile, "left-attach", cell[0])
+                self.grid.child_set_property(tile, "top-attach", cell[1])
+            else:
+                self.grid.attach(tile, *cell, 1, 1)
         # A maximized tile fills the grid because the hidden ones leave their
         # rows and columns empty, and empty grid lines take no space.
         for tile in tiles:
@@ -215,7 +216,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _create_tile(self, cam: Camera) -> CameraTile:
         tile = CameraTile(cam, wake=self.neolink.acquire, sleep=self.neolink.release,
-                          ready=self.neolink.ready)
+                          ready=self.neolink.ready, note=self.neolink.note,
+                          stage=self.neolink.stage)
         tile.connect("button-press-event", self._on_tile_click)
         self.tiles[cam.id] = tile
         return tile
@@ -278,17 +280,27 @@ class MainWindow(Gtk.ApplicationWindow):
             self.relayout()
 
     def take_snapshot(self, tile: CameraTile) -> None:
-        data = tile.snapshot_png()
-        if not data:
-            self._notify("No frame available yet for a snapshot.")
-            return
-        folder = snapshot_dir()
-        folder.mkdir(parents=True, exist_ok=True)
-        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in tile.camera.name)
-        path = folder / f"{safe}_{datetime.now():%Y%m%d_%H%M%S}.png"
-        path.write_bytes(data)
-        log.info("snapshot saved to %s", path)
-        self._notify(f"Snapshot saved to {path}")
+        """Save the tile's current picture; the tile's caption says where it went."""
+        taken = datetime.now()
+
+        def save(data: bytes | None) -> None:
+            if not data:
+                tile.flash("No picture to take a snapshot of yet")
+                return
+            folder = snapshot_dir()
+            safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in tile.camera.name)
+            path = folder / f"{safe}_{taken:%Y%m%d_%H%M%S}_{taken.microsecond // 1000:03d}.png"
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            except OSError as exc:
+                log.error("could not save %s: %s", path, exc)
+                tile.flash(f"Couldn't save the snapshot: {exc.strerror or exc}", 8)
+                return
+            log.info("snapshot saved to %s", path)
+            tile.flash(f"Snapshot saved to {path}", 6)
+
+        tile.snapshot_png(save)
 
     def _notify(self, text: str) -> None:
         dlg = Gtk.MessageDialog(transient_for=self, modal=True,
@@ -351,7 +363,7 @@ class MainWindow(Gtk.ApplicationWindow):
         about.connect("activate", lambda *_: self._about())
         menu.append(about)
         quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", lambda *_: self.app.quit())
+        quit_item.connect("activate", lambda *_: self.close())
         menu.append(quit_item)
 
         menu.show_all()
@@ -374,6 +386,11 @@ class MainWindow(Gtk.ApplicationWindow):
             other = "sub" if tile.active_stream == "main" else "main"
             item(f"Switch to {other} stream", lambda: tile.set_stream_override(other))
         item("Snapshot", lambda: self.take_snapshot(tile))
+        if api.has_api(tile.camera) is None:
+            if importlib.util.find_spec(f"{__package__}.recordings"):
+                item("Recordings…", lambda: self.show_recordings(tile))
+            if importlib.util.find_spec(f"{__package__}.zoom"):
+                item("Zoom and focus…", lambda: self.show_zoom_focus(tile))
         if tile.camera.on_demand:
             if tile.is_playing:
                 item("Sleep now", tile.stop)
@@ -388,6 +405,19 @@ class MainWindow(Gtk.ApplicationWindow):
         item("Remove", lambda: self.remove_camera(tile))
         menu.show_all()
         return menu
+
+    def show_recordings(self, tile: CameraTile) -> None:
+        from . import recordings  # noqa: PLC0415  (brings in the clip player only when used)
+
+        # A recording decodes on the GPU next to the live pictures, and a maximized
+        # 4K live view leaves little GPU memory: go back to the grid first.
+        self.restore()
+        recordings.show_recordings(self, tile.camera)
+
+    def show_zoom_focus(self, tile: CameraTile) -> None:
+        from . import zoom  # noqa: PLC0415
+
+        zoom.show_zoom_focus(self, tile.camera)
 
     def _open_snapshots(self) -> None:
         folder = snapshot_dir()
@@ -458,7 +488,7 @@ class MainWindow(Gtk.ApplicationWindow):
         elif ctrl and key in (Gdk.KEY_n, Gdk.KEY_N):
             self.add_camera()
         elif ctrl and key in (Gdk.KEY_q, Gdk.KEY_Q):
-            self.app.quit()
+            self.close()
         elif Gdk.KEY_1 <= key <= Gdk.KEY_9 and not ctrl:
             tiles = self.ordered_tiles()
             idx = key - Gdk.KEY_1
@@ -477,13 +507,22 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_login_rejected(self, cam_id: str) -> None:
         tile = self.tiles.get(cam_id)
         if tile:
-            tile.stop("Login rejected: check the password (Edit…)")
+            tile.stop(player.LOGIN_REJECTED)
 
     def _on_delete(self, *_):
+        self.shut_down()
+        return False
+
+    def shut_down(self) -> None:
+        """Stop everything before the window goes. Every way of quitting comes
+        through here: a pipeline left playing at exit can crash the process."""
+        self.hide()  # the window disappears at once; the rest takes a moment
         for tile in self.tiles.values():
             tile.dispose()
         self.neolink.stop()
-        return False
+        recordings = sys.modules.get(f"{__package__}.recordings")
+        if recordings is not None:
+            recordings.shutdown()
 
 
 class ViewerApp(Gtk.Application):
@@ -526,7 +565,8 @@ class ViewerApp(Gtk.Application):
 
     def do_shutdown(self):
         if self.window is not None:
-            self.window.neolink.stop()  # Ctrl+Q skips the window's delete-event
+            self.window.neolink.stop()  # in case the window never got to close
+        api.logout_all()  # give the cameras their API sessions back
         Gtk.Application.do_shutdown(self)
 
     def save(self) -> None:
@@ -536,6 +576,22 @@ class ViewerApp(Gtk.Application):
             save_settings(self.settings, self.config_path)
         except OSError as exc:
             log.error("could not save %s: %s", self.config_path, exc)
+
+
+def _report_freezes(interval_ms: int = 100, late_ms: int = 150) -> None:
+    """With -v, log whenever the window was frozen: a timer that should fire
+    every 100 ms and fired much later means something blocked the GTK thread."""
+    last = [GLib.get_monotonic_time()]
+
+    def tick() -> bool:
+        now = GLib.get_monotonic_time()
+        gap_ms = (now - last[0]) / 1000
+        last[0] = now
+        if gap_ms > interval_ms + late_ms:
+            log.debug("the window was frozen for %.0f ms", gap_ms - interval_ms)
+        return True
+
+    GLib.timeout_add(interval_ms, tick)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -555,5 +611,7 @@ def main(argv: list[str] | None = None) -> int:
     GLib.set_prgname(APP_ID)
     GLib.set_application_name(APP_NAME)
     Gst.init(None)
+    if args.verbose:
+        _report_freezes()
     app = ViewerApp(args.config, args.urls)
     return app.run([sys.argv[0]])
