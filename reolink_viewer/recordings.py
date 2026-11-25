@@ -35,7 +35,8 @@ log = logging.getLogger(__name__)
 
 # The Quality switch: the camera's stream, and what Reolink's own app calls it.
 QUALITIES = {"sub": "Fluent", "main": "Clear"}
-QUALITY_TIP = "Fluent clips are small and start quickly. Clear clips are large and use far more GPU memory."
+QUALITY_TIP = ("Clear is the camera's full resolution: the window always opens with it. "
+               "Fluent clips are small and start quickly.")
 FILTERS = ("Person", "Vehicle", "Animal", "Motion")
 SEEK_STEP_S = 5
 LIST_WIDTH = 360  # pixels: the five filter buttons side by side
@@ -209,7 +210,7 @@ class RecordingsWindow(Gtk.Window):
         self.set_default_size(1280, 760)
         self.cam: Camera | None = None
         self._api: api.CameraApi | None = None
-        self._stream = "sub"
+        self._stream = "main"
         self._wanted = ""  # the filter: what must have triggered a clip, "" for any
         self._recordings: list[api.Recording] = []  # the day's clips, oldest first
         self._current: api.Recording | None = None  # the clip chosen (opening, playing or failed)
@@ -390,7 +391,7 @@ class RecordingsWindow(Gtk.Window):
 
     def show_camera(self, parent: Gtk.Window, cam: Camera) -> None:
         """Show this camera's recordings in place of whatever the window showed,
-        starting at today in Fluent quality."""
+        starting at today in Clear quality: the best the camera recorded."""
         if self.get_visible() and cam == self.cam:
             self.present()
             return
@@ -404,10 +405,10 @@ class RecordingsWindow(Gtk.Window):
         self._updating = True
         self.calendar.select_month(today.month - 1, today.year)
         self.calendar.select_day(today.day)
-        self.quality_buttons["sub"].set_active(True)
+        self.quality_buttons["main"].set_active(True)
         self.filter_buttons[""].set_active(True)
         self._updating = False
-        self._stream, self._wanted, self._marked = "sub", "", None
+        self._stream, self._wanted, self._marked = "main", "", None
         self._load(pick_day=True)
         self.present()
 
@@ -656,7 +657,7 @@ class RecordingsWindow(Gtk.Window):
             self._open(url)
 
     def _open(self, uri: str) -> None:
-        self.player.open(uri, self._current.duration.total_seconds() or None, self.cam.audio)
+        self.player.open(uri, self._current.duration.total_seconds() or None, self.cam.sound)
 
     def _download(self, why: str) -> None:
         """Fetch the current clip into the cache, showing how far it is, then play the file."""
@@ -810,6 +811,16 @@ def show_recordings(parent: Gtk.Window, cam: Camera) -> None:
     if _window is None:
         _window = RecordingsWindow()
     _window.show_camera(parent, cam)
+
+
+def window() -> "RecordingsWindow | None":
+    """The Recordings window, if it was ever opened in this run."""
+    return _window
+
+
+def is_open() -> bool:
+    """Whether the Recordings window is showing (live sound stays off meanwhile)."""
+    return _window is not None and _window.get_visible()
 
 
 def close_recordings(cam_id: str) -> None:

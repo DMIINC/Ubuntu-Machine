@@ -187,16 +187,22 @@ class MainWindow(Gtk.ApplicationWindow):
             if other not in self.shown:
                 other.stop()  # save bandwidth/CPU/GPU memory while hidden
         self.relayout()  # lenses move side by side before they start
+        listening = self._listening()
         for lens in self.shown:
+            # The stream switch below connects again anyway: with sound, for the picked camera.
+            lens.set_sound(lens is listening, reconnect=False)
             self._set_stream(lens, "main" if self.settings.hd_when_maximized else None)
             if not lens.is_playing:
                 lens.start()
+            else:
+                lens.set_sound(lens is listening)  # still without sound: connect again
 
     def restore(self) -> None:
         if not self.focused:
             return
         self.focused = None
         self.shown = []
+        self._update_sound()  # the grid is silent
         for tile in self.tiles.values():
             if tile.camera.on_demand:
                 tile.stop()  # back to sleep, before the stream switch restarts it
@@ -205,6 +211,21 @@ class MainWindow(Gtk.ApplicationWindow):
         for tile in self.tiles.values():
             if not tile.is_playing and not tile.camera.on_demand:
                 tile.start()
+
+    def _listening(self) -> CameraTile | None:
+        """The tile whose sound plays: the camera the user picked (not its other
+        lens), and none in the grid or while the Recordings window is open."""
+        recordings = sys.modules.get(f"{__package__}.recordings")
+        if recordings is not None and recordings.is_open():
+            return None
+        return self.focused
+
+    def _update_sound(self, *_args) -> None:
+        if self._shut_down:
+            return
+        listening = self._listening()
+        for tile in self.tiles.values():
+            tile.set_sound(tile is listening)
 
     def toggle_fullscreen(self) -> None:
         if self.is_fullscreen:
@@ -430,6 +451,11 @@ class MainWindow(Gtk.ApplicationWindow):
         # 4K live view leaves little GPU memory: go back to the grid first.
         self.restore()
         recordings.show_recordings(self, tile.camera)
+        window = recordings.window()
+        if window is not None and not getattr(window, "_sound_watched", False):
+            # A recording's sound and a live camera's don't play at once.
+            window._sound_watched = True
+            window.connect("notify::visible", self._update_sound)
 
     def show_zoom_focus(self, tile: CameraTile) -> None:
         from . import zoom

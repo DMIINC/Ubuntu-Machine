@@ -224,3 +224,47 @@ def test_callbacks_from_a_replaced_connection_are_ignored(make_tile, run_loop):
     assert tile._on_first_frame(old) is False
     assert tile._status == "Connecting…"  # the old connection's frame didn't make it "Live"
     assert run_loop(lambda: tile._status == "Live", 15)
+
+
+def _audio_elements(playbin) -> list[str]:
+    """Names of the audio decoders and sinks inside a playbin."""
+    from gi.repository import Gst
+
+    found = []
+    iterator = playbin.iterate_recurse()
+    while True:
+        result, element = iterator.next()
+        if result != Gst.IteratorResult.OK:
+            break
+        factory = element.get_factory()
+        klass = factory.get_metadata("klass") if factory else ""
+        if "Audio" in klass and ("Decoder" in klass or "Sink" in klass):
+            found.append(factory.get_name())
+    return found
+
+
+def test_sound_only_while_picked(make_tile, run_loop, caplog):
+    import dataclasses
+
+    tile = make_tile(stream="main")  # the fake camera's main stream on channel 1 has sound
+    tile.start()
+    assert run_loop(lambda: tile._status == "Live", 15)
+    assert not tile._audio_on and _audio_elements(tile._playbin) == []  # the grid is silent
+
+    with caplog.at_level(logging.INFO, logger="reolink_viewer.player"):
+        tile.set_sound(True)  # picked: connects again, with sound
+        assert run_loop(lambda: connects(caplog) == 1, 5)
+    assert run_loop(lambda: tile._status == "Live", 15)
+    assert tile._audio_on and not tile._playbin.get_property("mute")
+    assert run_loop(lambda: any("dec" in name for name in _audio_elements(tile._playbin)), 5)
+
+    with caplog.at_level(logging.INFO, logger="reolink_viewer.player"):
+        tile.set_sound(False)  # back to the grid: muted at once, no new connection
+        run_loop(lambda: False, 0.5)
+    assert tile._playbin.get_property("mute") and connects(caplog) == 1
+
+    tile.set_camera(dataclasses.replace(tile.camera, sound=False))  # the user turned its sound off
+    with caplog.at_level(logging.INFO, logger="reolink_viewer.player"):
+        tile.set_sound(True)
+        run_loop(lambda: False, 0.5)
+    assert tile._playbin.get_property("mute") and connects(caplog) == 1  # nothing to connect for

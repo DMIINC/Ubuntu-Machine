@@ -370,6 +370,11 @@ def make_video_sink() -> VideoSink:
     )
 
 
+def _video_only(_source, _number: int, caps: Gst.Caps) -> bool:
+    """rtspsrc's select-stream: set up only the camera's video stream."""
+    return caps.get_size() == 0 or caps.get_structure(0).get_string("media") != "audio"
+
+
 class CameraTile(Gtk.EventBox):
     """Shows one camera. Owns a playbin pipeline and restarts it on errors or stalls.
 
@@ -416,6 +421,9 @@ class CameraTile(Gtk.EventBox):
         # The camera refused the login. Not tried again until the user edits the
         # camera or asks to reconnect: every refusal counts toward its lockout.
         self._login_rejected = False
+        # Only the camera the user picked plays sound (MainWindow decides).
+        self._sound = False
+        self._audio_on = False  # the current connection was made with sound
         self._status = self._idle_status()
 
         # Let the event box receive clicks on top of the video widget.
@@ -469,16 +477,16 @@ class CameraTile(Gtk.EventBox):
         old_url = self._playing_url()
         self.camera = camera
         unchanged = (
-            (old.audio, old.protocol, old.uid, old.host, old.username, old.password)
-            == (camera.audio, camera.protocol, camera.uid, camera.host, camera.username, camera.password)
+            (old.protocol, old.uid, old.host, old.username, old.password)
+            == (camera.protocol, camera.uid, camera.host, camera.username, camera.password)
             and old_url == self._playing_url()
         )
         if unchanged:
             self._update_label()
+            self.set_sound(self._sound)  # the sound setting may have changed
             return
         self._ext_worked = self._ext_unavailable = False
         self._login_rejected = False  # an edited camera is worth one more try
-        self._apply_audio_flag()
         if camera.on_demand and not old.on_demand:
             self.stop()  # now a battery camera: it sleeps until the user opens it
         elif self._wanted or (was_rejected and not camera.on_demand):
@@ -556,6 +564,7 @@ class CameraTile(Gtk.EventBox):
         self._stop_pipeline()
         if self._sink_stale and not self._replace_stale_sink():
             return
+        self._apply_audio_flag()  # in NULL state, where playbin takes new flags
         if uri != self._last_uri and self._sink.pacer is not None:
             self._sink.pacer.reset(new_stream=True)
         self._last_uri = uri
@@ -579,6 +588,24 @@ class CameraTile(Gtk.EventBox):
 
     def restart(self) -> None:
         self.start()
+
+    def set_sound(self, on: bool, reconnect: bool = True) -> None:
+        """Let this tile play its camera's sound, or not. Off is at once (muted).
+        On needs sound in the pipeline: a connection made without it is made again,
+        unless reconnect is False (the caller is about to connect anyway).
+        A battery camera isn't reconnected for it (that would wake it again):
+        its sound comes with its next connection."""
+        self._sound = on
+        audible = self._audible()
+        if self._playbin is not None:
+            self._playbin.set_property("mute", not audible)
+        if (reconnect and audible and self._wanted and not self._audio_on
+                and self._last_uri and not self.camera.on_demand):
+            log.info("[%s] connecting again, with sound", self.camera.name)
+            self.restart()
+
+    def _audible(self) -> bool:
+        return self._sound and self.camera.sound
 
     def reconnect(self) -> None:
         """Reconnect because the user asked: tries the balanced stream again if it
@@ -797,8 +824,11 @@ class CameraTile(Gtk.EventBox):
         return False
 
     def _apply_audio_flag(self) -> None:
-        flags = "video+audio+soft-volume" if self.camera.audio else "video"
-        Gst.util_set_object_arg(self._playbin, "flags", flags)
+        """Sound only for the picked camera. The others don't play it, and RTSP
+        cameras aren't even asked for it (see _on_source_setup)."""
+        self._audio_on = self._audible()
+        Gst.util_set_object_arg(self._playbin, "flags", "video+audio+soft-volume" if self._audio_on else "video")
+        self._playbin.set_property("mute", not self._audio_on)
 
     def _on_source_setup(self, _playbin, source) -> None:
         factory = source.get_factory()
@@ -815,6 +845,10 @@ class CameraTile(Gtk.EventBox):
             if self.camera.on_demand:
                 source.set_property("tcp-timeout", NEOLINK_TIMEOUT_US)
                 source.connect("on-sdp", self._on_sdp)
+            elif not self._audio_on:
+                # A silent tile doesn't ask the camera for its sound at all. (Not
+                # done for neolink: what it serves without its audio is untested.)
+                source.connect("select-stream", _video_only)
         elif name in ("souphttpsrc",):
             source.set_property("is-live", True)
 

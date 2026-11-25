@@ -52,7 +52,10 @@ class Camera:
     channel: int = 1
     stream: str = "sub"
     codec: str = "h264"
-    audio: bool = False
+    # Play the camera's sound when it is maximized (only the camera the user picked
+    # plays sound, and none while a recording is open), and in its recordings.
+    # Replaces "audio" (sound all the time, also in the grid), which is ignored.
+    sound: bool = True
     custom_url: str = ""
     uid: str = ""  # battery cameras: the UID from the Reolink app's Device Info
     # Port of the camera's web interface (recordings, zoom and focus);

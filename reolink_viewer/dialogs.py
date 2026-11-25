@@ -57,7 +57,9 @@ class CameraDialog(Gtk.Dialog):
         self.stream = _combo(STREAMS, cam.stream)
         self.codec = _combo(CODECS, cam.codec)
         self.codec.set_tooltip_text("RTSP only. Pick H.265 for cameras set to H.265 encoding (e.g. 4K models)")
-        self.audio = Gtk.CheckButton(label="Play audio", active=cam.audio)
+        self.sound = Gtk.CheckButton(label="Sound when maximized", active=cam.sound)
+        self.sound.set_tooltip_text("The grid is always silent. A maximized camera plays its sound, "
+                                    "except while the Recordings window is open; its recordings too.")
         self.custom_url = Gtk.Entry(
             text=cam.custom_url,
             activates_default=True,
@@ -84,7 +86,7 @@ class CameraDialog(Gtk.Dialog):
             ("Stream", self.stream),
             ("Codec", self.codec),
             ("Custom URL", self.custom_url),
-            ("", self.audio),
+            ("", self.sound),
             ("URL", self.preview),
             ("", self.hint),
         ]
@@ -174,6 +176,6 @@ class CameraDialog(Gtk.Dialog):
             channel=int(self.channel.get_value()),
             stream=self.stream.get_active_id(),
             codec=self.codec.get_active_id(),
-            audio=self.audio.get_active(),
+            sound=self.sound.get_active(),
             custom_url=self.custom_url.get_text().strip(),
         )

@@ -168,13 +168,13 @@ def test_opening_marks_the_days_and_lists_today_newest_first(rec, parent, run_lo
         assert [day for day in range(1, 31) if window.calendar.get_day_is_marked(day)] == [19, 24, 25]
         assert tuple(window.calendar.get_date()) == (2026, 10, 25)  # the calendar counts months from 0
         assert listed(window) == ["17:00", "12:00", "08:00"]
-        # Fluent quality unless asked otherwise: the small files.
-        assert window.quality_buttons["sub"].get_active()
-        assert {row.recording.stream for row in window.listbox.get_children()} == {"sub"}
+        # Clear quality unless asked otherwise: the best the camera recorded.
+        assert window.quality_buttons["main"].get_active()
+        assert {row.recording.stream for row in window.listbox.get_children()} == {"main"}
         row = window.listbox.get_row_at_index(1)
-        assert texts(row) == {"12:00:00", "4 s", "Person · Motion", "3.0 MB"}
+        assert texts(row) == {"12:00:00", "4 s", "Person · Motion", "30.0 MB"}
         quality = window.quality_buttons["main"].get_parent().get_parent()
-        assert "Clear clips are large and use far more GPU memory" in quality.get_tooltip_text()
+        assert "always opens with it" in quality.get_tooltip_text()
         # Nothing plays before a clip is chosen.
         assert window.player.state == "idle" and window.cover.get_visible()
         assert window.cover_text.get_text() == rec.CHOOSE
@@ -183,7 +183,7 @@ def test_opening_marks_the_days_and_lists_today_newest_first(rec, parent, run_lo
         # One login; one search for the month's days, and two for the day (the
         # second asks whether more clips follow the last one found).
         assert fake.commands == ["Login", "Search", "Search", "Search"]
-    assert "[Garage South] Fluent recordings on 2026-11-25: 3" in caplog.text
+    assert "[Garage South] Clear recordings on 2026-11-25: 3" in caplog.text
 
 
 def test_opens_on_the_latest_day_with_recordings(rec, parent, run_loop, monkeypatch):
@@ -217,16 +217,16 @@ def test_an_empty_day_and_another_month_say_so(rec, parent, run_loop):
 def test_the_quality_switch_lists_the_other_stream(rec, parent, run_loop):
     with fill(FakeCamera()) as fake:
         window = open_window(rec, parent, fake, run_loop)
-        window.quality_buttons["main"].set_active(True)
+        window.quality_buttons["sub"].set_active(True)
         assert window.list_status.get_text() == rec.SEARCHING
         assert run_loop(lambda: listed(window) == ["17:00", "12:00", "08:00"])
-        assert {row.recording.stream for row in window.listbox.get_children()} == {"main"}
-        assert "30.0 MB" in texts(window.listbox.get_row_at_index(0))
-        # The next camera starts with the small files again.
+        assert {row.recording.stream for row in window.listbox.get_children()} == {"sub"}
+        assert "3.0 MB" in texts(window.listbox.get_row_at_index(0))
+        # The next camera starts in the best quality again.
         with fill(FakeCamera()) as other:
             window = open_window(rec, parent, other, run_loop, name="Driveway")
-            assert window.quality_buttons["sub"].get_active()
-            assert {row.recording.stream for row in window.listbox.get_children()} == {"sub"}
+            assert window.quality_buttons["main"].get_active()
+            assert {row.recording.stream for row in window.listbox.get_children()} == {"main"}
 
 
 def test_the_trigger_filter_narrows_the_list(rec, parent, run_loop):
@@ -338,7 +338,7 @@ def test_a_rejected_login_is_shown_and_tried_exactly_once(rec, parent, run_loop)
 
         window.calendar.select_day(24)
         assert settled()
-        window.quality_buttons["main"].set_active(True)
+        window.quality_buttons["sub"].set_active(True)
         assert settled()
         window.calendar.select_month(9, 2026)
         assert settled()
