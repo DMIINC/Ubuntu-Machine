@@ -55,6 +55,23 @@
 static uintptr_t main_start, main_end; /* where the main program (neolink) is loaded */
 static int any_caller;                 /* for tests, where the caller isn't the main program */
 
+/* The real functions, looked up once in the constructor: it runs before neolink
+ * has any threads, so no call can see a half-filled set. */
+static void (*real_set_suspend_mode)(void *, int);
+static void (*real_set_stream_type)(void *, int);
+static int (*real_set_state)(void *, int);
+static char *(*real_get_name)(void *);
+static void (*real_free)(void *);
+
+static void look_up(void)
+{
+    real_set_suspend_mode = dlsym(RTLD_NEXT, "gst_rtsp_media_factory_set_suspend_mode");
+    real_set_stream_type = dlsym(RTLD_NEXT, "gst_app_src_set_stream_type");
+    real_set_state = dlsym(RTLD_NEXT, "gst_element_set_state");
+    real_get_name = dlsym(RTLD_DEFAULT, "gst_object_get_name");
+    real_free = dlsym(RTLD_DEFAULT, "g_free");
+}
+
 static int find_main_program(struct dl_phdr_info *info, size_t size, void *data)
 {
     (void)size;
@@ -77,6 +94,7 @@ static int find_main_program(struct dl_phdr_info *info, size_t size, void *data)
 __attribute__((constructor)) static void neolink_shim_init(void)
 {
     dl_iterate_phdr(find_main_program, NULL);
+    look_up();
     const char *any = getenv("NEOLINK_SHIM_ANY_CALLER");
     any_caller = any && *any == '1';
     /* The viewer looks for this line to know the library is in place. */
@@ -94,43 +112,33 @@ static int from_neolink(void *return_address)
 /* c: keep each client's pipeline running between DESCRIBE and PLAY */
 void gst_rtsp_media_factory_set_suspend_mode(void *factory, int mode)
 {
-    static void (*real)(void *, int);
-    if (!real)
-        real = dlsym(RTLD_NEXT, "gst_rtsp_media_factory_set_suspend_mode");
-    if (real)
-        real(factory, from_neolink(__builtin_return_address(0)) ? GST_RTSP_SUSPEND_MODE_NONE : mode);
+    if (real_set_suspend_mode)
+        real_set_suspend_mode(factory,
+                              from_neolink(__builtin_return_address(0)) ? GST_RTSP_SUSPEND_MODE_NONE : mode);
 }
 
 /* b: no flushing seek when the appsrc starts, so early frames are kept */
 void gst_app_src_set_stream_type(void *appsrc, int type)
 {
-    static void (*real)(void *, int);
-    if (!real)
-        real = dlsym(RTLD_NEXT, "gst_app_src_set_stream_type");
-    if (real)
-        real(appsrc, from_neolink(__builtin_return_address(0)) ? GST_APP_STREAM_TYPE_STREAM : type);
+    if (real_set_stream_type)
+        real_set_stream_type(appsrc,
+                             from_neolink(__builtin_return_address(0)) ? GST_APP_STREAM_TYPE_STREAM : type);
 }
 
 /* a: ignore neolink's own PAUSED/PLAYING on its appsrc ("vidsrc" / "audsrc") */
 int gst_element_set_state(void *element, int state)
 {
-    static int (*real)(void *, int);
-    static char *(*get_name)(void *);
-    static void (*free_name)(void *);
-    if (!real) {
-        real = dlsym(RTLD_NEXT, "gst_element_set_state");
-        get_name = dlsym(RTLD_DEFAULT, "gst_object_get_name");
-        free_name = dlsym(RTLD_DEFAULT, "g_free");
-    }
-    if (!real)
+    if (!real_set_state)
+        look_up(); /* called before the constructor ran (another library's constructor) */
+    if (!real_set_state)
         return 0; /* GST_STATE_CHANGE_FAILURE */
-    if (state >= GST_STATE_PAUSED && get_name && free_name
+    if (state >= GST_STATE_PAUSED && real_get_name && real_free
         && from_neolink(__builtin_return_address(0))) {
-        char *name = get_name(element);
+        char *name = real_get_name(element);
         int neolink_appsrc = name && (!strcmp(name, "vidsrc") || !strcmp(name, "audsrc"));
-        free_name(name);
+        real_free(name);
         if (neolink_appsrc)
             return GST_STATE_CHANGE_SUCCESS;
     }
-    return real(element, state);
+    return real_set_state(element, state);
 }

@@ -7,6 +7,11 @@ at all and seeking fails, so the clip is downloaded first and played from disk.
 probe() finds out which it is with one request, and puts a camera's refusal
 into plain words before GStreamer gets involved.
 
+Size matters too: GStreamer reads an MP4 of up to 4 MB to its end before the
+first picture when the index is at the end, Range or not (measured at 1 MB/s:
+3.8 MB started after 3.9 s, 4.6 MB after 0.8 s). For a clip that small,
+downloading costs the same wait and can show its progress.
+
 Standard library only, no GTK: Download reports back through a function its
 owner supplies (a window passes GLib.idle_add).
 

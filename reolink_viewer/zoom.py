@@ -350,6 +350,12 @@ def close_zoom_focus(cam_id: str) -> None:
         window.destroy()
 
 
+def close_all() -> None:
+    """Close every zoom and focus window (the app is exiting)."""
+    for cam_id in list(_windows):
+        close_zoom_focus(cam_id)
+
+
 def _forget(window: ZoomFocusWindow, cam_id: str) -> None:
     if _windows.get(cam_id) is window:
         del _windows[cam_id]

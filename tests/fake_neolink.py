@@ -1,4 +1,4 @@
-#!/usr/bin/python3.12
+#!/usr/bin/python3
 """Fake neolink: stands in for `neolink rtsp --config FILE` in Reolink Viewer tests.
 
 It is NOT neolink. It imitates what the viewer can see of neolink 0.6.3-rc.2:
@@ -74,10 +74,10 @@ Recipes
   quick timeline ("Available" after ~3 s and ~4 s)
       FAKE_NEOLINK_DISCOVERY_S=1 FAKE_NEOLINK_LOGIN_S=0.3 FAKE_NEOLINK_POSTLOGIN_S=0.4 FAKE_NEOLINK_STREAM_S=1.3
 
-Needs /usr/bin/python3.12 with PyGObject, the GstRtspServer typelib (gir1.2-gst-rtsp-server-1.0) and
+Needs Python 3 with PyGObject, the GstRtspServer typelib (gir1.2-gst-rtsp-server-1.0) and
 x264enc. The port comes from the TOML: the viewer hard-codes 18554 (config.py NEOLINK_PORT), so a test
 harness that needs another port has to patch reolink_viewer.config.NEOLINK_PORT before importing
-reolink_viewer.neolink (see scratchpad/agent-4/run_viewer.py).
+reolink_viewer.neolink.
 """
 from __future__ import annotations
 
@@ -502,7 +502,7 @@ class Server:
         return all(c.available_at is not None for c in self.cameras)
 
     def run(self) -> int:
-        log("INFO", "neolink", f"Neolink {VERSION} release (FAKE: scratchpad/harness/fake_neolink.py)")
+        log("INFO", "neolink", f"Neolink {VERSION} release (FAKE: tests/fake_neolink.py)")
         for cam in self.cameras:
             cam.start()
         log("INFO", "neolink::rtsp", f"Starting RTSP Server at {self.bind[0]}:{self.bind[1]}")

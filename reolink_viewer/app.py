@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import logging
 import math
 import sys
@@ -246,6 +245,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.settings.cameras[idx] = cam
             self.app.save()
             self.neolink.apply(self.settings.cameras)
+            self._close_camera_windows(cam.id)  # they hold the old login
             tile.set_camera(cam)
         dlg.destroy()
 
@@ -265,6 +265,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.settings.cameras = [c for c in self.settings.cameras if c.id != tile.camera.id]
         self.app.save()
         self.neolink.apply(self.settings.cameras)
+        self._close_camera_windows(tile.camera.id)
         del self.tiles[tile.camera.id]
         tile.destroy()
         self._apply_grid_stream()
@@ -386,11 +387,9 @@ class MainWindow(Gtk.ApplicationWindow):
             other = "sub" if tile.active_stream == "main" else "main"
             item(f"Switch to {other} stream", lambda: tile.set_stream_override(other))
         item("Snapshot", lambda: self.take_snapshot(tile))
-        if api.has_api(tile.camera) is None:
-            if importlib.util.find_spec(f"{__package__}.recordings"):
-                item("Recordings…", lambda: self.show_recordings(tile))
-            if importlib.util.find_spec(f"{__package__}.zoom"):
-                item("Zoom and focus…", lambda: self.show_zoom_focus(tile))
+        if api.has_api(tile.camera) is None:  # battery cameras have no web interface
+            item("Recordings…", lambda: self.show_recordings(tile))
+            item("Zoom and focus…", lambda: self.show_zoom_focus(tile))
         if tile.camera.on_demand:
             if tile.is_playing:
                 item("Sleep now", tile.stop)
@@ -406,8 +405,19 @@ class MainWindow(Gtk.ApplicationWindow):
         menu.show_all()
         return menu
 
+    @staticmethod
+    def _close_camera_windows(cam_id: str) -> None:
+        # Only a window that was opened can hold an out-of-date login, and its
+        # module is loaded by then.
+        recordings = sys.modules.get(f"{__package__}.recordings")
+        if recordings is not None:
+            recordings.close_recordings(cam_id)
+        zoom = sys.modules.get(f"{__package__}.zoom")
+        if zoom is not None:
+            zoom.close_zoom_focus(cam_id)
+
     def show_recordings(self, tile: CameraTile) -> None:
-        from . import recordings  # noqa: PLC0415  (brings in the clip player only when used)
+        from . import recordings  # loaded on first use: it brings in the clip player
 
         # A recording decodes on the GPU next to the live pictures, and a maximized
         # 4K live view leaves little GPU memory: go back to the grid first.
@@ -415,7 +425,7 @@ class MainWindow(Gtk.ApplicationWindow):
         recordings.show_recordings(self, tile.camera)
 
     def show_zoom_focus(self, tile: CameraTile) -> None:
-        from . import zoom  # noqa: PLC0415
+        from . import zoom
 
         zoom.show_zoom_focus(self, tile.camera)
 
@@ -520,9 +530,12 @@ class MainWindow(Gtk.ApplicationWindow):
         for tile in self.tiles.values():
             tile.dispose()
         self.neolink.stop()
+        zoom = sys.modules.get(f"{__package__}.zoom")
+        if zoom is not None:
+            zoom.close_all()
         recordings = sys.modules.get(f"{__package__}.recordings")
         if recordings is not None:
-            recordings.shutdown()
+            recordings.shutdown()  # also deletes the clips downloaded for playing
 
 
 class ViewerApp(Gtk.Application):

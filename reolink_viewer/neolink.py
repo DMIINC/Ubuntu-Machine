@@ -244,6 +244,8 @@ class Neolink:
         """
         if self._proc is None or cam.id not in self._serving:
             return False
+        if self._serving[cam.id] != self._awake.get(cam.id):
+            return False  # another stream was asked for: neolink is about to restart
         if not self._ready >= self._serving.keys():
             return False
         now = time.monotonic()
@@ -291,7 +293,8 @@ class Neolink:
             log.info("[%s] wake%s: %s s", cam.name, " (with speed-up)" if self._shim_active else "",
                      " · ".join(f"{text} {moment - start:.1f}" for moment, text in steps[1:]))
             del self._timeline[cam.id]
-            if what.startswith("gave up") and cam.id in self._ready:
+            connected = any(text.startswith("connect#") for _, text in steps)
+            if what.startswith("gave up") and connected and cam.id in self._ready:
                 self._wake_failed_with_stream_up()
 
     def _wake_failed_with_stream_up(self) -> None:
@@ -299,10 +302,11 @@ class Neolink:
         # library is in use it is the first suspect: it has only been tried in
         # simulation. Do without it for the rest of this run.
         if self._shim_active and not self._shim_off:
+            # Takes effect the next time neolink starts: restarting it now would
+            # cut off a lens that is playing.
             self._shim_off = True
             log.warning("battery camera gave no video with the wake speed-up: "
-                        "switching it off until the viewer is restarted")
-            self._serving = {}  # restart neolink without it on the next wake
+                        "not using it from the next start of neolink until the viewer is restarted")
 
     def stop(self) -> None:
         proc, self._proc = self._proc, None
@@ -411,8 +415,15 @@ class Neolink:
             if uid and uid in text:
                 text = text.replace(uid, uid[:4] + "…")  # the UID opens the camera: keep it out of logs
         if LOGIN_REJECTED in text and cam_id in names:
-            self._rejected.add(cam_id)
-            self._on_login_rejected(cam_id)
+            # The camera refused this login, so the other lens of a dual-lens
+            # camera (same UID and login) must not try it either: neolink exits
+            # on the first refusal and would otherwise be restarted for that lens.
+            refused = self._cameras[cam_id]
+            login = (refused.uid.strip(), refused.username, refused.password)
+            for cam in list(self._cameras.values()):
+                if (cam.uid.strip(), cam.username, cam.password) == login and cam.id not in self._rejected:
+                    self._rejected.add(cam.id)
+                    self._on_login_rejected(cam.id)
         if level == "ERROR":
             log.warning("neolink: %s", text)
         elif level in ("WARN", "INFO") and m:
@@ -425,10 +436,10 @@ class Neolink:
         if proc is self._proc:  # not stopped by us
             log.warning("neolink exited (code %s)", proc.returncode)
             served = self._serving.keys()
-            if (self._shim_used and not self._shim_off and not served & self._rejected
-                    and time.monotonic() - self._started < 30):
-                # Never seen, but if neolink dies young with the library loaded, the
-                # library (tried only in simulation so far) is the first suspect.
+            if self._shim_used and not self._shim_off and not served & self._rejected:
+                # Never seen, but if neolink dies with the library loaded, the library
+                # (tried only in simulation so far) is the first suspect. Apart from a
+                # refused login, neolink doesn't exit by itself.
                 self._shim_off = True
                 log.warning("neolink exited while using the wake speed-up: switching it off "
                             "until the viewer is restarted")

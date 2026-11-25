@@ -23,6 +23,7 @@ cameras.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import re
@@ -39,11 +40,14 @@ from .config import DEFAULT_PORTS, Camera, rtmp_safe
 
 log = logging.getLogger(__name__)
 
-TIMEOUT_S = 8
+TIMEOUT_S = 10
 SEARCH_TIMEOUT_S = 25  # searching an SD card can take a while
 LOGOUT_TIMEOUT_S = 2
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SEARCH_PAGES = 30
+# A playback URL must outlive the clip it plays: renew the session when less
+# than this is left (reolink_aio uses the same margin).
+PLAYBACK_LEASE_MARGIN_S = 300
 # HTTPS first: several cameras ship with plain HTTP turned off.
 DEFAULT_API_PORTS = ((443, True), (80, False))
 
@@ -74,6 +78,22 @@ class _NoAnswer(Exception):
     """The request never got a usable answer from the camera's API (internal)."""
 
 
+class _Unanswered(_NoAnswer):
+    """The request reached the camera, but no usable answer came back (internal).
+
+    For a Login that matters: the camera may have counted (and refused) it, so
+    the password must not be offered again, not even at another port."""
+
+
+def _now() -> float:
+    """Seconds on a clock that keeps running while the computer sleeps: a camera's
+    session runs out in real time, and monotonic() stops during suspend."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return time.monotonic()
+
+
 @dataclass(frozen=True)
 class Recording:
     """One recorded clip on the camera's SD card (or NVR disk). Times are the camera's local time."""
@@ -84,6 +104,9 @@ class Recording:
     stream: str  # "main" or "sub"
     name: str  # the file's path on the camera; "" on NVRs, which address clips by time
     triggers: tuple[str, ...] = ()  # e.g. ("Person", "Motion")
+    # NVRs: the clip's PlaybackTime (UTC, YYYYmmddHHMMSS), what their playback
+    # service is asked for; "" when the search result has none.
+    playback_start: str = ""
 
     @property
     def duration(self) -> timedelta:
@@ -155,7 +178,12 @@ def _parse_recording(data: dict, stream: str) -> Recording | None:
         size = int(data.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
-    return Recording(start, end, size, str(data.get("type") or stream), name, parse_triggers(name))
+    try:
+        playback_start = f"{_from_reolink_time(data['PlaybackTime']):%Y%m%d%H%M%S}"
+    except (KeyError, TypeError, ValueError):
+        playback_start = ""
+    return Recording(start, end, size, str(data.get("type") or stream), name, parse_triggers(name),
+                     playback_start)
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -174,7 +202,7 @@ def tls_context(legacy: bool = False) -> ssl.SSLContext:
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     if legacy:
-        context.minimum_version = ssl.TLSVersion.TLSv1
+        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
         context.set_ciphers("DEFAULT:@SECLEVEL=0")
     else:
         context.set_ciphers("DEFAULT")
@@ -205,6 +233,34 @@ def _is_credential_error(code: int, detail: str) -> bool:
 # Logins a camera has refused: (host, user, password) -> what to tell the user.
 # Not tried again until one of the three changes.
 _rejected: dict[tuple[str, str, str], str] = {}
+# Logins the camera answered with "locked" -> when. A lock passes, so the user
+# may ask for one more try (apiui does), but nothing tries again by itself.
+_locked: dict[tuple[str, str, str], float] = {}
+# One login at a time per (host, user, password), across sessions: two entries
+# for one device (NVR channels, a dual-lens camera) must not both send a login
+# that is about to be refused.
+_login_locks: dict[tuple[str, str, str], threading.Lock] = {}
+_login_locks_guard = threading.Lock()
+
+
+def _login_lock(key: tuple[str, str, str]) -> threading.Lock:
+    with _login_locks_guard:
+        return _login_locks.setdefault(key, threading.Lock())
+
+
+def locked_since(cam: Camera) -> float | None:
+    """Minutes since the camera said this login is locked, or None."""
+    at = _locked.get((cam.host.strip(), cam.username, cam.password))
+    return None if at is None else (_now() - at) / 60
+
+
+def allow_after_lock(cam: Camera) -> None:
+    """The user asked to try a locked login once more."""
+    _locked.pop((cam.host.strip(), cam.username, cam.password), None)
+
+
+_LOCKED = ("The camera has locked this login after too many failed attempts. Wait for the lock "
+           "to clear (or restart the camera), then open this window again to try once more.")
 
 
 def login_is_risky(cam: Camera) -> bool:
@@ -251,7 +307,7 @@ class CameraApi:
 
     @property
     def logged_in(self) -> bool:
-        return bool(self._token) and time.monotonic() < self._token_expires
+        return bool(self._token) and _now() < self._token_expires
 
     # ---------------------------------------------------------------- login
 
@@ -265,27 +321,40 @@ class CameraApi:
             if problem:
                 raise NotSupported(problem)
             key = self.login_key()
-            if key in _rejected:
-                raise LoginRejected(_rejected[key])
-            body = [{"cmd": "Login", "action": 0, "param": {
-                "User": {"userName": self.cam.username, "password": self.cam.password}}}]
-            tried = []
-            for port, https in self._ports:
-                base = f"{'https' if https else 'http'}://{_host(self.cam)}:{port}"
-                try:
-                    answer = self._post(base, https, "Login", body, "null", TIMEOUT_S)
-                except _NoAnswer as exc:
-                    tried.append(f"{'HTTPS' if https else 'HTTP'} port {port}: {exc}")
-                    continue
-                # The camera's API answered. Whatever it said, the same password
-                # is not offered at another port.
-                self._finish_login(base, https, answer, key)
-                return
-            log.info("[%s] no HTTP(S) API reachable: %s", self.cam.name, "; ".join(tried))
-            raise NotReachable(
-                "Couldn't reach the camera's web interface. In the Reolink app, check "
-                "Settings → Network → Advanced → Server Settings: HTTPS (or HTTP) must be on."
-            )
+            with _login_lock(key):
+                self._login(key)
+
+    def _login(self, key: tuple[str, str, str]) -> None:
+        if key in _rejected:
+            raise LoginRejected(_rejected[key])
+        if key in _locked:
+            raise LoginRejected(_LOCKED)
+        body = [{"cmd": "Login", "action": 0, "param": {
+            "User": {"userName": self.cam.username, "password": self.cam.password}}}]
+        tried = []
+        for port, https in self._ports:
+            base = f"{'https' if https else 'http'}://{_host(self.cam)}:{port}"
+            try:
+                answer = self._post(base, https, "Login", body, "null", TIMEOUT_S)
+            except _Unanswered as exc:
+                # The camera got the login and may have counted it: the same
+                # password is not offered at another port.
+                log.warning("[%s] API login got no usable answer: %s", self.cam.name, exc)
+                raise ApiError(
+                    "The camera got the login but didn't answer properly. Not trying again "
+                    "now; try once more in a minute.") from None
+            except _NoAnswer as exc:
+                tried.append(f"{'HTTPS' if https else 'HTTP'} port {port}: {exc}")
+                continue
+            # The camera's API answered. Whatever it said, the same password
+            # is not offered at another port.
+            self._finish_login(base, https, answer, key)
+            return
+        log.info("[%s] no HTTP(S) API reachable: %s", self.cam.name, "; ".join(tried))
+        raise NotReachable(
+            "Couldn't reach the camera's web interface. In the Reolink app, check "
+            "Settings → Network → Advanced → Server Settings: HTTPS (or HTTP) must be on."
+        )
 
     def _finish_login(self, base: str, https: bool, answer: list, key: tuple[str, str, str]) -> None:
         item = answer[0] if answer and isinstance(answer[0], dict) else {}
@@ -298,7 +367,7 @@ class CameraApi:
             self._base, self._https = base, https
             self._token = str(token["name"])
             # Renew a minute early rather than have a command bounce.
-            self._token_expires = time.monotonic() + max(lease - 60, 30)
+            self._token_expires = _now() + max(lease - 60, 30)
             self._logged_in_once = True
             log.info("[%s] logged in to the camera's API over %s", self.cam.name,
                      "HTTPS" if https else "HTTP")
@@ -307,16 +376,28 @@ class CameraApi:
         log.warning("[%s] API login refused: %s (%s)", self.cam.name, detail or "no detail", code)
         if _is_credential_error(code, detail):
             if "locked" in detail.lower():
-                message = ("The camera has locked this login after too many failed attempts. "
-                           "Wait for the lock to clear (or restart the camera), then check the password.")
-            else:
-                message = ("The camera rejected the user name or password. It won't be tried "
-                           "again until you change them (right-click → Edit…).")
+                # Says nothing about the password; a lock passes after a while.
+                _locked[key] = _now()
+                raise LoginRejected(_LOCKED)
+            message = ("The camera rejected the user name or password. It won't be tried "
+                       "again until you change them (right-click → Edit…).")
             _rejected[key] = message
             raise LoginRejected(message)
         if code == -5:
             raise ApiError("The camera has too many open sessions right now. Try again in a few minutes.")
         raise ApiError(f"The camera refused the login ({detail or f'code {code}'}).")
+
+    def forget_token(self, url_or_token: str) -> bool:
+        """The camera refused a playback URL with "please login first" (it restarted,
+        or the session ran out while the computer slept). Drop that token so the
+        next playback_url() logs in afresh, which is safe: this login was accepted.
+        Only the token in question is dropped, so two clips refused at once cause
+        one new login. Returns whether it was still the current one."""
+        with self._lock:
+            if self._token and self._token in url_or_token:
+                self._token, self._token_expires = "", 0.0
+                return True
+            return False
 
     def logout(self, timeout: float = LOGOUT_TIMEOUT_S) -> None:
         """Give the session back (cameras allow only a few). Never raises."""
@@ -373,24 +454,33 @@ class CameraApi:
                 with opener.open(request, timeout=timeout) as response:
                     raw = response.read(MAX_RESPONSE_BYTES)
             except urllib.error.HTTPError as exc:
-                raise _NoAnswer(f"HTTP {exc.code}") from None
-            except ssl.SSLError as exc:
-                last = exc  # the handshake failed before anything was sent: try old TLS
-                continue
+                # A server error may come after the request was handled; a redirect
+                # or "not found" means this isn't the camera's API.
+                kind = _Unanswered if exc.code >= 500 else _NoAnswer
+                raise kind(f"HTTP {exc.code}") from None
             except urllib.error.URLError as exc:
+                # urllib wraps what fails while connecting and sending: nothing was
+                # delivered, so old TLS (or the next port) may be tried.
                 if isinstance(exc.reason, ssl.SSLError) and not legacy:
                     last = exc
                     continue
                 raise _NoAnswer(_reason(exc)) from None
-            except (OSError, ValueError) as exc:  # timeouts, resets, bad URLs
+            except (OSError, http.client.HTTPException) as exc:
+                # Not wrapped: it failed after the request went out (no answer in
+                # time, the connection dropped, a broken TLS record, garbage back).
+                raise _Unanswered(_reason(exc)) from None
+            except ValueError as exc:  # a malformed URL: nothing was sent
                 raise _NoAnswer(_reason(exc)) from None
             self._legacy_tls = legacy
             if not expect_json:
                 return []
+            text = raw.decode("utf-8", "replace")
             try:
-                answer = json.loads(raw.decode("utf-8", "replace"))
+                answer = json.loads(text)
             except ValueError:
-                raise _NoAnswer("not a Reolink API answer") from None
+                # A cut-off answer from the camera, or some other web server's page.
+                kind = _Unanswered if text.lstrip()[:1] in ("[", "{") else _NoAnswer
+                raise kind("not a Reolink API answer") from None
             if not isinstance(answer, list):
                 raise _NoAnswer("not a Reolink API answer")
             return answer
@@ -444,6 +534,9 @@ class CameraApi:
         """A URL that plays the clip. Carries the session token (or, for NVRs,
         the login), so treat it like a password: redact it before logging."""
         with self._lock:
+            if self.logged_in and self._token_expires - _now() < PLAYBACK_LEASE_MARGIN_S - 60:
+                # The clip may play for minutes: start it on a fresh session.
+                self.logout()
             self.login()
             if rec.name:
                 # The camera sends the file as MP4.
@@ -459,7 +552,8 @@ class CameraApi:
                     "Playing recordings from an NVR needs a password whose only symbols are - _ . ~ or !")
             stream_type = 1 if rec.stream == "sub" else 0
             return (f"{self._base}/flv?port={DEFAULT_PORTS['rtmp']}&app=bcs&stream=playback.bcs"
-                    f"&channel={self.channel}&type={stream_type}&start={rec.start:%Y%m%d%H%M%S}"
+                    f"&channel={self.channel}&type={stream_type}"
+                    f"&start={rec.playback_start or f'{rec.start:%Y%m%d%H%M%S}'}"
                     f"&seek=0&user={self.cam.username}&password={self.cam.password}")
 
     @property

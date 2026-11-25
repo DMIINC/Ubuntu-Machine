@@ -25,9 +25,9 @@ from .config import redact_url  # noqa: E402
 log = logging.getLogger(__name__)
 
 SPEEDS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
-OPEN_TIMEOUT_S = 15  # some failures never post an error: no picture by then means give up
+OPEN_TIMEOUT_S = 15  # some failures never post an error: nothing arriving for this long means give up
 SEEK_TIMEOUT_S = 10  # a jump on a source that can't seek may never be answered
-STALL_TIMEOUT_S = 20  # playing, but no new frame for this long
+STALL_TIMEOUT_S = 20  # started, but nothing new for this long
 POSITION_INTERVAL_MS = 200
 # playbin's buffer for http(s). Small, so the pause after a jump stays short
 # (the default 2 MB cost 2.7 s of pauses at 1 MB/s).
@@ -99,6 +99,11 @@ def _build_output(kind: str) -> tuple[Gst.Element, Gst.Element] | None:
     return element, gtk_sink
 
 
+def _masked(text: str | None) -> str:
+    """GStreamer's error details quote the URL, token and all: mask it before it is logged or shown."""
+    return " ".join(redact_url(word) if "://" in word else word for word in (text or "").split())
+
+
 def classify_error(err: GLib.Error, debug: str | None, streamed: bool,
                    from_source: bool) -> tuple[str, str]:
     """(kind, text for the user) for a GStreamer error. streamed: the clip comes
@@ -126,13 +131,8 @@ def classify_error(err: GLib.Error, debug: str | None, streamed: bool,
     if streamed and from_source:
         if err.matches(Gst.StreamError.quark(), Gst.StreamError.FAILED):
             return "network", "The connection to the camera failed"  # GStreamer gives no reason
-        return "network", f"The connection to the camera failed ({err.message})"
-    return "other", err.message
-
-
-def _masked(text: str | None) -> str:
-    """GStreamer's error details quote the URL, token and all: mask it for the log."""
-    return " ".join(redact_url(word) if "://" in word else word for word in (text or "").split())
+        return "network", f"The connection to the camera failed ({_masked(err.message)})"
+    return "other", _masked(err.message)
 
 
 class ClipPlayer(Gtk.Box):
@@ -141,7 +141,9 @@ class ClipPlayer(Gtk.Box):
     Put it in a window before the first open(), and never move it to another
     container: the GPU outputs stay bound to the surface they first drew on.
     Make one and keep it (hide its window instead of destroying it), because
-    each player's video sink stays in memory for good.
+    each player's video sink stays in memory for good. Call stop() when the
+    window is hidden: a paused or finished clip keeps its decoder, and with it
+    the GPU memory of its frames (over 1 GB for a 4K recording).
 
     The owner may set on_state(state), called when the state changes,
     on_ended(), called when a clip has played to its end, and
@@ -166,10 +168,12 @@ class ClipPlayer(Gtk.Box):
         self._stepped = False
         self._seek_busy = False
         self._seek_next: tuple[float, bool] | None = None  # asked for while a jump is under way
+        self._seek_target = 0.0  # where the jump under way goes
         self._dragging = False
-        self._frames = 0  # buffers that reached the sink (counted on a streaming thread)
-        self._progress = (0, 0.0)  # (frames seen, when that last changed), for the stall check
-        self._open_guard = 0
+        # Counted on streaming threads: pieces of the recording read, frames at the sink.
+        self._arrived = 0
+        self._frames = 0
+        self._progress: tuple[object, float] = (None, 0.0)  # (sign of life, when it last changed)
         self._seek_guard = 0
         self._timer = 0
         self._closed = False
@@ -179,6 +183,7 @@ class ClipPlayer(Gtk.Box):
         self._element: Gst.Element | None = None
         self._gtk_sink: Gst.Element | None = None
         self._video: Gtk.Widget | None = None
+        self._surface_lost = False  # see _on_video_unmapped
 
         self._stage = Gtk.Box()  # holds the video widget (and, hidden, any that failed)
         self.pack_start(self._stage, True, True, 0)
@@ -194,7 +199,7 @@ class ClipPlayer(Gtk.Box):
         self._step_button.connect("clicked", lambda _button: self.step())
         # Built from an adjustment: new_with_range() would round dragging to whole seconds.
         self._scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
-                                adjustment=Gtk.Adjustment(0, 0, 1, 1, 10, 0))
+                                adjustment=Gtk.Adjustment.new(0, 0, 1, 1, 10, 0))
         self._scale.set_draw_value(False)
         self._scale.set_hexpand(True)
         self._scale.connect("change-value", self._on_scale_moved)
@@ -261,6 +266,13 @@ class ClipPlayer(Gtk.Box):
         """The video output in use: "gl", "wayland", "cpu", or "" if none works."""
         return self._kind
 
+    @property
+    def video_area(self) -> Gtk.Widget:
+        """The part of the player the picture is drawn in. The last frame stays
+        on it while the next clip opens and after an error, so an owner may want
+        to lay something over it (a Gtk.Overlay around the player moves nothing)."""
+        return self._stage
+
     def open(self, uri: str, duration_hint_seconds: float | None = None, audio: bool = False) -> None:
         """Play `uri` (file:// or http(s)://) from its start, in place of whatever was open.
 
@@ -314,12 +326,26 @@ class ClipPlayer(Gtk.Box):
         if not self._seek_busy:
             self._send_seek()
 
+    def skip(self, seconds: float) -> None:
+        """Jump forward (or, below zero, back) from where the recording is. A jump
+        still under way counts as made, so quick calls add up: three presses of
+        an arrow key are three steps, however slow the jumps are."""
+        if self._seek_next is not None:
+            start: float | None = self._seek_next[0]
+        elif self._seek_busy:
+            start = self._seek_target
+        else:
+            start = self.position
+        if start is not None:
+            self.seek(start + seconds)
+
     def set_speed(self, speed: float) -> None:
         """Play `speed` times as fast (one of SPEEDS). Needs a recording that can seek."""
+        index = SPEEDS.index(speed)
         if speed == self._speed or not (self._prerolled and self._seekable):
             return
         self._speed = speed
-        self._speed_box.set_active(SPEEDS.index(speed))
+        self._speed_box.set_active(index)
         self._playbin.set_property("mute", speed != 1.0)  # sound at another speed is noise
         position = self.position
         if position is not None and self._state in ("playing", "paused"):
@@ -335,6 +361,8 @@ class ClipPlayer(Gtk.Box):
 
     def stop(self) -> None:
         """Close the recording; this also drops the connection to the camera."""
+        if self._closed:
+            return
         self._halt()
         self._uri = ""
         self._show_idle()
@@ -387,8 +415,34 @@ class ClipPlayer(Gtk.Box):
         self._video.set_vexpand(True)
         self._stage.pack_start(self._video, True, True, 0)
         self._video.show()
+        # An output that replaces another may be started at once, before GTK has
+        # given its widget a size. gtkwaylandsink then asks the compositor for a
+        # picture 0 pixels high, a protocol error that ends the whole app. The
+        # widget is the only one showing in the stage: it gets all of it.
+        place = self._stage.get_allocation()
+        if place.width > 1 and place.height > 1:
+            self._video.get_preferred_size()  # GTK wants to be asked before it is told
+            self._video.size_allocate(place)
+        if kind == "wayland":
+            self._video.connect("unmap", self._on_video_unmapped)
+        self._surface_lost = False
         log.debug("recordings use the %s video output", kind)
         return True
+
+    def _on_video_unmapped(self, widget: Gtk.Widget) -> None:
+        # gtkwaylandsink draws on a subsurface of its window's surface, and a
+        # window gives that surface up while it is hidden. Shown again, the sink
+        # still takes frames but none reaches the screen: the next clip gets a
+        # new one. (gtkglsink draws through GTK and comes back with the window.)
+        if widget is self._video:
+            self._surface_lost = True
+
+    def _drop_output(self) -> None:
+        """Take the video output out of use. Its widget stays where it is, hidden: see _sinks."""
+        self._halt()
+        self._release_playbin()
+        self._video.set_no_show_all(True)
+        self._video.hide()
 
     def _release_playbin(self) -> None:
         if self._playbin is None:
@@ -406,10 +460,7 @@ class ClipPlayer(Gtk.Box):
         live tiles too) and start the clip again on the next one allowed."""
         failed = self._kind
         player._failed_kinds.add(failed)
-        self._halt()
-        self._release_playbin()
-        self._video.set_no_show_all(True)
-        self._video.hide()
+        self._drop_output()
         if self._use_next_output():
             log.warning("%s video output failed; switching to %s", failed, self._kind)
             self._start()
@@ -424,11 +475,14 @@ class ClipPlayer(Gtk.Box):
 
     def _start(self) -> None:
         self._halt()
+        if self._surface_lost:
+            self._drop_output()
+            self._use_next_output()
         self._duration = self._hint
         self._seekable = False
         self._stepped = False
-        self._frames = 0
-        self._progress = (0, time.monotonic())
+        self._arrived = self._frames = 0
+        self._progress = (None, time.monotonic())
         self._speed = 1.0
         self._speed_box.set_active(SPEEDS.index(1.0))
         self._show_idle()
@@ -444,10 +498,8 @@ class ClipPlayer(Gtk.Box):
         Gst.util_set_object_arg(self._playbin, "flags",
                                 "video+audio+soft-volume" if self._audio else "video")
         self._playbin.set_property("mute", False)
-        network = self._uri.startswith(("http://", "https://"))
-        self._playbin.set_property("buffer-size", NET_BUFFER_BYTES if network else -1)
+        self._playbin.set_property("buffer-size", NET_BUFFER_BYTES if self._streamed() else -1)
         self._set_state("opening", "Opening…")
-        self._open_guard = GLib.timeout_add_seconds(OPEN_TIMEOUT_S, self._on_open_timeout)
         self._timer = GLib.timeout_add(POSITION_INTERVAL_MS, self._on_tick)
         # PAUSED first: at the first picture the length and whether it can seek are known.
         if self._playbin.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
@@ -457,9 +509,12 @@ class ClipPlayer(Gtk.Box):
             else:
                 self._fail("other", "The recording could not be started")
 
+    def _streamed(self) -> bool:
+        return self._uri.startswith(("http://", "https://"))
+
     def _halt(self) -> None:
         """Stop the pipeline and everything that waits on it."""
-        for name in ("_open_guard", "_seek_guard", "_timer"):
+        for name in ("_seek_guard", "_timer"):
             if getattr(self, name):
                 GLib.source_remove(getattr(self, name))
                 setattr(self, name, 0)
@@ -510,6 +565,13 @@ class ClipPlayer(Gtk.Box):
             # A recording is a file: not is-live, unlike the live player's HTTP-FLV.
             source.set_property("timeout", HTTP_TIMEOUT_S)
             source.set_property("ssl-strict", False)  # cameras present self-signed certificates
+        pad = source.get_static_pad("src")
+        if pad is not None:
+            pad.add_probe(Gst.PadProbeType.BUFFER, self._on_data)
+
+    def _on_data(self, _pad, _info):
+        self._arrived += 1  # streaming thread: nothing else here
+        return Gst.PadProbeReturn.OK
 
     def _on_element_added(self, _bin, _sub, element) -> None:
         factory = element.get_factory()
@@ -562,22 +624,19 @@ class ClipPlayer(Gtk.Box):
 
     def _on_error_message(self, msg: Gst.Message) -> None:
         err, debug = msg.parse_error()
-        log.warning("recording error from %s: %s (%s)", msg.src.get_name(), err.message, _masked(debug))
+        log.warning("recording error from %s: %s (%s)",
+                    msg.src.get_name(), _masked(err.message), _masked(debug))
         if self._kind != "cpu" and (
             self._in_output(msg.src) or (not self._frames and "not-negotiated" in (debug or ""))
         ):
             # As for the live tiles: the GPU output can't be used on this system.
             self._fall_back()
             return
-        streamed = self._uri.startswith(("http://", "https://"))
         from_source = msg.src == self._playbin.get_property("source")
-        self._fail(*classify_error(err, debug, streamed, from_source))
+        self._fail(*classify_error(err, debug, self._streamed(), from_source))
 
     def _on_first_picture(self) -> None:
         self._prerolled = True
-        if self._open_guard:
-            GLib.source_remove(self._open_guard)
-            self._open_guard = 0
         self._read_stream_info()
         if self._want_play and not self._buffering:
             self._playbin.set_state(Gst.State.PLAYING)
@@ -621,6 +680,7 @@ class ClipPlayer(Gtk.Box):
             self._status_label.set_text("Can't jump in this recording")
             return
         self._seek_busy = True
+        self._seek_target = seconds
         if self._seek_guard:
             GLib.source_remove(self._seek_guard)
         self._seek_guard = GLib.timeout_add_seconds(SEEK_TIMEOUT_S, self._on_seek_timeout)
@@ -634,28 +694,35 @@ class ClipPlayer(Gtk.Box):
             self._fail("no-range", "Jumping in this recording did not work")
         return False
 
-    def _on_open_timeout(self) -> bool:
-        self._open_guard = 0
-        if not self._prerolled:
-            self._fail("network" if self._uri.startswith("http") else "other",
-                       "The recording did not start")
-        return False
-
     def _on_tick(self) -> bool:
         if self._state in ("playing", "paused") and not self._seek_busy:
             self._show_position()
         # souphttpsrc retries a dead connection by itself and posts no error while
         # it does, so a camera that stops sending has to be noticed here.
         now = time.monotonic()
-        waiting = self._state == "playing" or (
-            self._buffering and self._want_play and self._state in ("paused", "opening"))
-        if not waiting or self._frames != self._progress[0]:
-            self._progress = (self._frames, now)
-        elif now - self._progress[1] > STALL_TIMEOUT_S:
-            self._timer = 0
-            self._fail("network", "The camera stopped sending the recording")
-            return False
-        return True
+        if self._state == "opening":
+            # Before the first picture, data coming in is the sign of life: an MP4
+            # of up to 4 MB is read to its end first, however slow the camera.
+            sign: object = ("data", self._arrived)
+        elif self._state == "playing" or (self._buffering and self._want_play and self._state == "paused"):
+            sign = ("frames", self._frames)
+        else:
+            sign = None
+        if sign is None or sign != self._progress[0]:
+            self._progress = (sign, now)
+            return True
+        quiet = now - self._progress[1]
+        if self._state == "opening" and not (self._streamed() and self._arrived):
+            if quiet <= OPEN_TIMEOUT_S:
+                return True
+            problem = ("network" if self._streamed() else "other", "The recording did not start")
+        elif quiet <= STALL_TIMEOUT_S:
+            return True
+        else:
+            problem = ("network", "The camera stopped sending the recording")
+        self._timer = 0  # this very timer: _fail() must not remove it
+        self._fail(*problem)
+        return False
 
     def _show_position(self, at_end: bool = False) -> None:
         position = self._duration if at_end and self._duration else self.position

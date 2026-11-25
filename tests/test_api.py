@@ -1,6 +1,11 @@
+import json
+import os
 import shutil
 import socket
+import ssl
 import subprocess
+import threading
+import time
 import urllib.request
 from datetime import date, datetime
 
@@ -15,11 +20,11 @@ from fake_reolink_api import FakeCamera, clip
 
 @pytest.fixture(autouse=True)
 def _fresh_memory():
-    api._rejected.clear()
-    api._sessions.clear()
+    for memory in (api._rejected, api._locked, api._sessions):
+        memory.clear()
     yield
-    api._rejected.clear()
-    api._sessions.clear()
+    for memory in (api._rejected, api._locked, api._sessions):
+        memory.clear()
 
 
 def cam(password="pw", **kwargs) -> Camera:
@@ -88,7 +93,22 @@ def test_locked_account_is_reported_and_not_retried():
             session.login()
         with pytest.raises(LoginRejected):
             session.login()
+        with pytest.raises(LoginRejected):
+            client(fake).login()  # the same login from a new session
         assert fake.login_attempts == 1
+        assert api.locked_since(session.cam) is not None
+
+
+def test_a_lock_can_be_tried_once_more_when_the_user_asks():
+    with FakeCamera(lock_after=0) as fake:
+        session = client(fake)
+        with pytest.raises(LoginRejected):
+            session.login()
+        fake.lock_after = None  # the lock has cleared
+        api.allow_after_lock(session.cam)  # what the window does after asking
+        session.login()
+        assert fake.login_attempts == 2 and session.logged_in
+        assert api.locked_since(session.cam) is None
 
 
 def test_unreachable_port_moves_on_to_the_next():
@@ -278,3 +298,162 @@ def test_parse_triggers():
     assert api.parse_triggers(name.format("6D28C08")) == ("Person", "Motion")
     assert api.parse_triggers(name.format("6D28908")) == ("Vehicle", "Motion")
     assert api.parse_triggers("20230417015957") == ()
+
+
+class MisbehavingPort:
+    """Reads a whole request, as a camera would, then misbehaves instead of answering."""
+
+    def __init__(self, mode: str, context: ssl.SSLContext | None = None):
+        self.mode, self.context = mode, context
+        self.logins = 0
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                raw, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(raw,), daemon=True).start()
+
+    def _one(self, raw: socket.socket) -> None:
+        conn = raw
+        try:
+            if self.context:
+                conn = self.context.wrap_socket(raw, server_side=True)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                data += chunk
+            head, _, body = data.partition(b"\r\n\r\n")
+            length = int(next(line.split(b":")[1] for line in head.split(b"\r\n")
+                              if line.lower().startswith(b"content-length")))
+            while len(body) < length:
+                body += conn.recv(65536)
+            if json.loads(body)[0]["cmd"] == "Login":
+                self.logins += 1
+            refused = json.dumps([{"cmd": "Login", "code": 1,
+                                   "error": {"detail": "login failed", "rspCode": -7}}]).encode()
+            if self.mode == "drop":
+                pass
+            elif self.mode == "stall":
+                time.sleep(api.TIMEOUT_S + 0.5)
+            elif self.mode == "http500":
+                conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: %d\r\n\r\n"
+                             % len(refused) + refused)
+            elif self.mode == "cut":
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                             + refused[:25])
+            elif self.mode == "garbage":
+                conn.sendall(b"\x00\x01 not http at all\r\n\r\n")
+            elif self.mode == "badrecord":  # a broken TLS record instead of the answer
+                os.write(conn.fileno(), b"\x17\x03\x03\x00\x20" + b"\x00" * 32)
+                time.sleep(0.2)
+        except (OSError, ValueError, StopIteration):
+            pass
+        finally:
+            raw.close()
+
+
+@pytest.mark.parametrize("mode", ["drop", "stall", "http500", "cut", "garbage"])
+def test_a_login_the_camera_got_is_not_offered_to_another_port(mode, monkeypatch):
+    monkeypatch.setattr(api, "TIMEOUT_S", 0.5)
+    first = MisbehavingPort(mode)
+    try:
+        with FakeCamera(password="right") as second:
+            session = CameraApi(cam("wrong"), ports=((first.port, False), (second.port, False)))
+            with pytest.raises(ApiError, match="didn't answer properly"):
+                session.login()
+            assert (first.logins, second.login_attempts) == (1, 0)
+    finally:
+        first.close()
+
+
+def test_a_broken_tls_answer_does_not_resend_the_login(certificate):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(*certificate)
+    first = MisbehavingPort("badrecord", context)
+    try:
+        with FakeCamera(password="right") as second:
+            session = CameraApi(cam("wrong"), ports=((first.port, True), (second.port, False)))
+            with pytest.raises(ApiError):
+                session.login()
+            assert (first.logins, second.login_attempts) == (1, 0)
+    finally:
+        first.close()
+
+
+class SlowLoginCamera(FakeCamera):
+    def _answer(self, cmd, token):
+        if cmd.get("cmd") == "Login":
+            time.sleep(0.4)
+        return super()._answer(cmd, token)
+
+
+def test_two_entries_for_one_device_send_one_refused_login():
+    with SlowLoginCamera(password="right") as fake:
+        entries = [cam("wrong", id=f"ch{n}", channel=n, api_port=fake.port) for n in (1, 2)]
+        errors = []
+
+        def use(entry):
+            try:
+                api.session_for(entry).recording_days(2026, 11)
+            except ApiError as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=use, args=(entry,)) for entry in entries]
+        for thread in threads:
+            thread.start()
+            time.sleep(0.1)
+        for thread in threads:
+            thread.join(10)
+        assert fake.login_attempts == 1 and len(errors) == 2
+        assert all(isinstance(exc, LoginRejected) for exc in errors)
+
+
+def test_a_playback_token_the_camera_dropped_is_replaced():
+    with FakeCamera() as fake:
+        fake.add_clips(clip(datetime(2026, 11, 24, 8)))
+        session = client(fake)
+        rec = session.recordings(date(2026, 11, 24))[0]
+        url = session.playback_url(rec)
+        fake.tokens.clear()  # the camera restarted
+        assert session.forget_token(url)
+        assert not session.forget_token(url)  # a second refusal of the same URL: no second login
+        fresh = session.playback_url(rec)
+        assert fresh != url and fake.login_attempts == 2
+        with urllib.request.urlopen(fresh) as response:
+            assert response.status == 200
+
+
+def test_a_playback_url_gets_a_session_that_outlives_the_clip():
+    with FakeCamera() as fake:
+        fake.add_clips(clip(datetime(2026, 11, 24, 8)))
+        session = client(fake)
+        rec = session.recordings(date(2026, 11, 24))[0]
+        session._token_expires = api._now() + 90  # a lease about to run out
+        url = session.playback_url(rec)
+        assert fake.login_attempts == 2 and "Logout" in fake.commands
+        with urllib.request.urlopen(url) as response:
+            assert response.status == 200
+
+
+def test_nvr_clips_are_asked_for_by_their_playback_time():
+    with FakeCamera() as fake:
+        entry = clip(datetime(2023, 4, 17, 1, 59, 57))
+        del entry["name"]  # NVRs list clips without a file name
+        entry["PlaybackTime"] = {"year": 2023, "mon": 4, "day": 16, "hour": 23, "min": 59, "sec": 57}
+        fake.add_clips(entry)
+        session = client(fake)
+        rec = session.recordings(date(2023, 4, 17))[0]
+        assert rec.playback_start == "20230416235957"
+        assert "&start=20230416235957&" in session.playback_url(rec)

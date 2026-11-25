@@ -58,6 +58,7 @@ class FakeCamera:
         self.lock_after = lock_after
         self.redirect_to = redirect_to
         self.clip_bytes = clip_bytes
+        self.refuse_playback: str | None = None  # a detail text: Playback answers with that error
         self.login_attempts = 0
         self.tokens: set[str] = set()
         self.paths: list[str] = []  # every request path, to prove what went into URLs
@@ -227,6 +228,11 @@ class FakeCamera:
                 if (query.get("token") or [""])[0] not in camera.tokens:
                     body = json.dumps([{"cmd": "Playback", "code": 1,
                                         "error": {"detail": "please login first", "rspCode": -6}}])
+                    self._send(200, body.encode(), "text/html")
+                    return
+                if camera.refuse_playback:
+                    body = json.dumps([{"cmd": "Playback", "code": 1,
+                                        "error": {"detail": camera.refuse_playback, "rspCode": -12}}])
                     self._send(200, body.encode(), "text/html")
                     return
                 data = camera.clip_bytes
