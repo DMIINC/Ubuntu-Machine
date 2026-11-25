@@ -83,7 +83,7 @@ reolink-viewer "rtsp://admin:PASS@192.168.1.50:554/h264Preview_01_main"
 |---|---|
 | Maximize / restore a camera | Double-click it, or press `1`–`9` / `0` / `Esc` |
 | Menu for one camera (switch stream, snapshot, recordings, zoom and focus, reconnect, reorder, edit, remove) | Right-click it |
-| In the Recordings window | `Space` play/pause, `←` `→` 5 s back/forward, `↑` `↓` previous/next clip, `Esc` close |
+| In the Recordings window | `Space` play/pause, `←` `→` 5 s back/forward, `↑` `↓` the later / earlier clip (as listed, newest at the top), `Esc` close |
 | Fullscreen | `F11` or `F` |
 | Add a camera | `Ctrl+N` |
 | Quit | `Ctrl+Q` |
