@@ -324,7 +324,8 @@ def _remove(path: Path) -> None:
 
 
 def clear_cache() -> None:
-    """Delete every downloaded recording, complete or not (call when the app exits)."""
+    """Delete every downloaded recording, complete or not (call when the app
+    exits, and at start-up for what a crashed run left)."""
     for path in _cached((".clip", ".part")):
         _remove(path)
 

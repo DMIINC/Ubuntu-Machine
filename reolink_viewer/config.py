@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -176,6 +177,15 @@ def build_url(cam: Camera, stream: str | None = None) -> str:
 
 # URL query keys whose value opens the camera: a password or a session token.
 _SECRET_KEYS = ("password", "pass", "pwd", "passwd", "token")
+_SECRET_PAIR = re.compile(r"(?i)\b(" + "|".join(_SECRET_KEYS) + r")=[^&\s,;)\"']*")
+_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^/@\s:]*):[^\s/]*@")
+
+
+def redact_text(text: str | None) -> str:
+    """Mask passwords and tokens anywhere in a text, e.g. GStreamer's error
+    details, which quote the full URL of what failed."""
+    text = _USERINFO.sub(r"\1:***@", text or "")
+    return _SECRET_PAIR.sub(lambda m: f"{m.group(1)}=***", text)
 
 
 def redact_url(url: str) -> str:

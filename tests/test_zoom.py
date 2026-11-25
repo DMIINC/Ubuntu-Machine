@@ -19,12 +19,12 @@ def zoom(gtk, monkeypatch):
 
     monkeypatch.setattr(module, "SETTLE_MS", 60)
     monkeypatch.setattr(module, "READBACK_DELAY_MS", 150)
-    for memory in (api._rejected, api._sessions, apiui._confirmed):
+    for memory in (api._rejected, api._locked, api._sessions, apiui._confirmed):
         memory.clear()
     yield module
     for window in list(module._windows.values()):
         window.destroy()
-    for memory in (api._rejected, api._sessions, apiui._confirmed):
+    for memory in (api._rejected, api._locked, api._sessions, apiui._confirmed):
         memory.clear()
 
 
@@ -343,3 +343,46 @@ def test_does_not_open_when_the_login_is_not_allowed(zoom, parent, run_loop, mon
         pause(run_loop, zoom)
         assert asked == [cam] and zoom._windows == {}
         assert fake.commands == []
+
+
+class RefusingCamera(FakeCamera):
+    """A camera that answers a change with an error code: nothing changes in it."""
+
+    def _answer(self, cmd: dict, token: str) -> dict:
+        if cmd.get("cmd") in ("SetAutoFocus", "StartZoomFocus") and token in self.tokens:
+            self.commands.append(cmd["cmd"])
+            return {"cmd": cmd["cmd"], "code": 0, "value": {"rspCode": -1}}
+        return super()._answer(cmd, token)
+
+
+def test_a_refused_change_puts_the_controls_back(zoom, parent, run_loop):
+    with RefusingCamera() as fake:
+        window = open_window(zoom, parent, fake, run_loop)
+        assert window.autofocus.get_active()
+        window.autofocus.set_active(False)
+        assert run_loop(lambda: "didn't accept" in window.status.get_text())
+        assert window.autofocus.get_active() and fake.autofocus_disabled == 0
+        assert window.autofocus_note.get_text() == zoom.AUTOFOCUS_ON
+
+        window.zoom.scale.set_value(20)
+        assert run_loop(lambda: "StartZoomFocus" in fake.commands)
+        assert run_loop(lambda: window.zoom.position == 10)  # where the camera says it is
+        assert window.zoom.number.get_text() == "10"
+
+
+def test_a_locked_login_can_be_tried_again_from_the_open_window(zoom, parent, run_loop, monkeypatch):
+    from reolink_viewer import apiui
+
+    asked = []
+    monkeypatch.setattr(apiui, "_ask", lambda window, question, detail, go: asked.append(question) or True)
+    with FakeCamera(lock_after=0) as fake:
+        window = open_window(zoom, parent, fake, run_loop)
+        assert "locked" in window.status.get_text()
+        fake.lock_after = None  # the lock has cleared
+        zoom.show_zoom_focus(parent, window.cam)  # what the message says to do
+        assert len(asked) == 1 and zoom._windows[window.cam.id] is window
+        assert run_loop(window.controls.get_sensitive)
+        assert fake.login_attempts == 2
+        zoom.show_zoom_focus(parent, window.cam)  # no lock any more: just brought to the front
+        pause(run_loop, zoom)
+        assert len(asked) == 1 and fake.login_attempts == 2

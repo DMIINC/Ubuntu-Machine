@@ -20,7 +20,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gst, Gtk  # noqa: E402
 
 from . import player  # noqa: E402
-from .config import redact_url  # noqa: E402
+from .config import redact_text, redact_url  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +37,9 @@ HTTP_TIMEOUT_S = 15  # souphttpsrc then asks again from where it stopped, by its
 # Error kinds that mean "this can't be played from the camera: download it and play the file".
 NEEDS_DOWNLOAD = ("no-range", "no-moov")
 
-# Every video sink ever made. A gtkglsink must never be freed: on Wayland that
-# terminates the EGL display GTK shares, and all GL drawing fails from then on.
+# Every gl video output ever made. A gtkglsink must never be freed: on Wayland
+# that terminates the EGL display GTK shares, and all GL drawing fails from then
+# on. The other outputs are freed when they are replaced.
 _sinks: list[tuple[Gst.Element, Gst.Element]] = []
 
 
@@ -95,13 +96,14 @@ def _build_output(kind: str) -> tuple[Gst.Element, Gst.Element] | None:
         element = Gst.parse_bin_from_description(description, True)
         gtk_sink = element.get_by_name("videosink")
     gtk_sink.set_property("sync", True)
-    _sinks.append((element, gtk_sink))
+    if kind == "gl":
+        _sinks.append((element, gtk_sink))
     return element, gtk_sink
 
 
 def _masked(text: str | None) -> str:
     """GStreamer's error details quote the URL, token and all: mask it before it is logged or shown."""
-    return " ".join(redact_url(word) if "://" in word else word for word in (text or "").split())
+    return redact_text(text)
 
 
 def classify_error(err: GLib.Error, debug: str | None, streamed: bool,
@@ -116,6 +118,8 @@ def classify_error(err: GLib.Error, debug: str | None, streamed: bool,
     if err.matches(Gst.ResourceError.quark(), Gst.ResourceError.SEEK):
         return "no-range", "The camera can't jump around in this recording while sending it"
     if "no 'moov' atom" in debug or "no known streams found" in debug:
+        if not streamed:
+            return "no-moov", "The recording is incomplete or damaged"
         return "no-moov", "This recording can only be played once it has been downloaded"
     if err.matches(Gst.ResourceError.quark(), Gst.ResourceError.NOT_FOUND):
         return "not-found", "The recording was not found"
@@ -438,11 +442,19 @@ class ClipPlayer(Gtk.Box):
             self._surface_lost = True
 
     def _drop_output(self) -> None:
-        """Take the video output out of use. Its widget stays where it is, hidden: see _sinks."""
+        """Take the video output out of use. A gl output's widget stays where it
+        is, hidden (see _sinks); any other is destroyed with its sink."""
         self._halt()
         self._release_playbin()
-        self._video.set_no_show_all(True)
-        self._video.hide()
+        if self._video is None:
+            return
+        if self._kind == "gl":
+            self._video.set_no_show_all(True)
+            self._video.hide()
+        else:
+            # Destroyed, not moved: the sink lets go of a widget being destroyed.
+            self._video.destroy()
+            self._video = self._element = self._gtk_sink = None
 
     def _release_playbin(self) -> None:
         if self._playbin is None:
@@ -545,6 +557,8 @@ class ClipPlayer(Gtk.Box):
             self.on_state(state)
 
     def _show_idle(self) -> None:
+        # A slider made insensitive mid-drag never gets the button's release.
+        self._dragging = False
         self._scale.set_sensitive(False)
         self._scale.set_value(0)
         self._speed_box.set_sensitive(False)
@@ -553,6 +567,7 @@ class ClipPlayer(Gtk.Box):
     def _fail(self, kind: str, text: str) -> None:
         log.warning("recording failed (%s): %s", kind, text)
         self._halt()
+        self._dragging = False
         self._scale.set_sensitive(False)
         self._speed_box.set_sensitive(False)
         self._set_state("error", text)

@@ -7,6 +7,7 @@ from reolink_viewer.config import (
     Settings,
     build_url,
     load_settings,
+    redact_text,
     redact_url,
     resolve_stream,
     save_settings,
@@ -131,3 +132,15 @@ def test_battery_camera_needs_uid():
         pass
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_redact_text_masks_passwords_and_tokens_in_any_text():
+    debug = ("../gst/rtmp2/gstrtmp2src.c(722): rtmp://cam:1935/bcs/channel0_ext.bcs?channel=0&stream=1"
+             "&user=admin&password=s3cr!t, then rtsp://admin:p@ss:w@cam:554/h264Preview_01_sub and "
+             "https://cam/cgi-bin/api.cgi?cmd=Playback&token=abc123&start=1")
+    masked = redact_text(debug)
+    for secret in ("s3cr!t", "p@ss", "abc123"):
+        assert secret not in masked
+    assert "password=***" in masked and "token=***" in masked and "rtsp://admin:***@cam:554/" in masked
+    assert "&start=1" in masked and "user=admin" in masked
+    assert redact_text(None) == ""

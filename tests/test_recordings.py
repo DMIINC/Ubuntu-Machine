@@ -636,7 +636,7 @@ def test_a_camera_that_dropped_the_session_still_plays_the_clip(rec, parent, cli
         choose(window, "12:00")
         assert playing(window, run_loop)
         assert fake.login_attempts == 2  # one new login, not one per refused request
-    assert "logging in again" in caplog.text
+    assert "dropped the session" in caplog.text
 
 
 def test_no_window_for_a_camera_the_user_declines(rec, parent, monkeypatch):
@@ -664,3 +664,34 @@ def test_shutdown_stops_everything_and_empties_the_cache(rec, parent, clip, run_
             assert rec._window is None
         finally:
             window.destroy()
+
+
+def test_a_download_cut_short_is_not_kept(rec, parent, clip, run_loop):
+    with fill(FakeCamera(clip_bytes=clip, ranges=False, content_length=False, cut_after=len(clip) // 2)) as fake:
+        window = open_window(rec, parent, fake, run_loop)
+        choose(window, "08:00")
+        assert run_loop(lambda: window.cover_text.get_text() == "The recording is incomplete or damaged", 15)
+        assert not list(rec.vod.cache_dir().glob("*.clip"))
+        fake.cut_after = None  # the camera sends whole files again
+        asked = len(fake.paths)
+        choose(window, "12:00")
+        choose(window, "08:00")  # fetched again, not the broken copy
+        run_loop(lambda: window.player.state in ("playing", "error"), 15)  # a download first
+        assert playing(window, run_loop)
+        assert any("source=" in path and "080000" in path for path in fake.paths[asked:])
+
+
+def test_two_clips_refused_at_once_share_one_new_login(rec, clip):
+    with fill(FakeCamera(clip_bytes=clip)) as fake:
+        session = api.session_for(camera(fake))
+        first, second = session.recordings(TODAY, "sub")[:2]
+        fake.tokens.clear()  # the camera restarted
+        answers = [None, None]
+        threads = [threading.Thread(target=lambda i=i, r=r: answers.__setitem__(i, rec._address(session, r)))
+                   for i, r in enumerate((first, second))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        assert all(probe.ok for _url, probe in answers), answers
+        assert fake.login_attempts == 2

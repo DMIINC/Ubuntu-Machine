@@ -375,7 +375,7 @@ def test_the_wayland_output_is_renewed_after_its_window_was_hidden(own_stage, cl
 
 def test_stop_shutdown_and_sinks_that_outlive_the_player(own_stage, clip, clip_player, run_loop):
     start(own_stage, run_loop, clip.as_uri())
-    sink = own_stage.player._gtk_sink
+    sink, kind = own_stage.player._gtk_sink, own_stage.player.output
     own_stage.player.stop()
     assert own_stage.player.state == "idle" and own_stage.player.position is None
     assert own_stage.states[-1] == "idle"
@@ -384,8 +384,29 @@ def test_stop_shutdown_and_sinks_that_outlive_the_player(own_stage, clip, clip_p
     own_stage.player.shutdown()
     own_stage.player.open(clip.as_uri())  # ignored from now on
     assert own_stage.player.state == "idle"
-    # Freeing a gtkglsink breaks GTK's GL on Wayland: every sink is kept for good.
-    assert any(kept is sink for _, kept in clip_player._sinks)
+    # Freeing a gtkglsink breaks GTK's GL on Wayland: those are kept for good.
+    assert any(kept is sink for _, kept in clip_player._sinks) == (kind == "gl")
+
+
+def test_only_gl_outputs_are_kept_for_good(gtk, clip_player):
+    from reolink_viewer import player
+
+    if not player._have("gtksink"):
+        pytest.skip("gtksink is not installed")
+    before = len(clip_player._sinks)
+    built = clip_player._build_output("cpu")
+    assert built is not None and len(clip_player._sinks) == before
+
+
+def test_a_drag_cut_short_by_the_next_clip_does_not_freeze_the_slider(stage, clip, run_loop):
+    from gi.repository import Gdk
+
+    start(stage, run_loop, clip.as_uri())
+    stage.player._scale.emit("button-press-event", Gdk.Event.new(Gdk.EventType.BUTTON_PRESS))
+    assert stage.player._dragging
+    start(stage, run_loop, clip.as_uri())  # the slider goes insensitive: its release never comes
+    assert not stage.player._dragging
+    assert run_loop(lambda: stage.player._scale.get_value() > 0.3, 5)  # it follows the clip again
 
 
 def test_open_outside_a_window_is_refused(clip_player, clip):

@@ -154,6 +154,7 @@ class ZoomFocusWindow(Gtk.Window):
         self._settling = False  # a command went out and the lens hasn't been read back since
         self._readback = 0  # timer for that read
         self._asked: tuple[_Row, int] | None = None  # the last move sent, to compare that read with
+        self._last: api.ZoomFocus | None = None  # what the camera said last
 
         self.zoom = _Row("zoom", self._next)
         self.focus = _Row("focus", self._next)
@@ -232,6 +233,15 @@ class ZoomFocusWindow(Gtk.Window):
         self._autofocus_wanted = None
         self.zoom.target = self.focus.target = None
         self._settling = False
+        if self._last is not None:
+            # Back to what the camera said last: a refused change didn't happen.
+            # (Rows the user has moved again since keep their new position.)
+            self._show_autofocus(self._last.autofocus)
+            self.zoom.show(self._last.zoom, self._last.zoom_min, self._last.zoom_max)
+            self.focus.show(self._last.focus, self._last.focus_min, self._last.focus_max)
+            if isinstance(exc, api.NotReachable):
+                # The command may have reached the camera before the answer was lost.
+                text = f"{text} Press Refresh to see where the lens is."
         self.status.set_text(text)
 
     # ------------------------------------------------------------------ reading
@@ -242,6 +252,7 @@ class ZoomFocusWindow(Gtk.Window):
         self._call(self._api.zoom_focus, self._on_state, self._on_read_failed)
 
     def _on_state(self, state: api.ZoomFocus) -> None:
+        self._last = state
         self.controls.set_sensitive(True)
         self.zoom.show(state.zoom, state.zoom_min, state.zoom_max)
         self.focus.show(state.focus, state.focus_min, state.focus_max)
@@ -332,6 +343,11 @@ def show_zoom_focus(parent: Gtk.Window, cam: Camera) -> None:
     """Open the camera's zoom and focus window, or bring the one that is open to the front."""
     window = _windows.get(cam.id)
     if window is not None and window.cam == cam:
+        # The camera may have locked the login while the window was open: asking
+        # again here is the way to try once more, as its message says.
+        if (api.locked_since(cam) is not None and apiui.ensure_login_allowed(parent, cam)
+                and _windows.get(cam.id) is window):
+            window.refresh()
         window.present()
         return
     close_zoom_focus(cam.id)  # the camera was edited since: start over with its new settings

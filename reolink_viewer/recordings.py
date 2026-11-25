@@ -138,13 +138,17 @@ def _address(session: api.CameraApi, rec: api.Recording) -> tuple[str, vod.Probe
     A camera that restarted, or a session that ran out while the computer slept,
     answers "please login first" to a playback address. Then the session is
     renewed once (that login was accepted before) and the clip asked for again.
+    Two clips refused at once share one renewal: the session logs in under its
+    lock, and only if nobody else has since.
     """
     url = session.playback_url(rec)
     probe = vod.probe(url)
-    if not probe.ok and probe.kind == "camera" and "login" in probe.text.lower() and session.forget_token(url):
-        log.info("[%s] the camera dropped the session: logging in again for the clip", session.cam.name)
-        url = session.playback_url(rec)
-        probe = vod.probe(url)
+    if not probe.ok and probe.kind == "camera" and "login" in probe.text.lower():
+        session.forget_token(url)
+        fresh = session.playback_url(rec)
+        if fresh != url:
+            log.info("[%s] the camera dropped the session: asking again with a new one", session.cam.name)
+            url, probe = fresh, vod.probe(fresh)
     return url, probe
 
 
@@ -625,6 +629,9 @@ class RecordingsWindow(Gtk.Window):
             self._download(f"the camera only sends whole files, {size}")
         elif probe.size is not None and probe.size <= SMALL_CLIP_BYTES:
             self._download(f"a small clip, {size}")
+        elif self._api.legacy_tls:
+            # GStreamer's HTTPS doesn't speak the old TLS of this camera's firmware.
+            self._download(f"the camera only has old TLS, {size}")
         else:
             self._via = "stream"
             log.info("[%s] %s: playing it from the camera (%s)", self.cam.name, self._clip_name(), size)
@@ -672,6 +679,10 @@ class RecordingsWindow(Gtk.Window):
             self.player.stop()  # takes the error off the player's own status line
             self._download(f"playing it from the camera failed: {text}")
         else:
+            if self._via in ("download", "cache") and kind in ("no-moov", "not-video", "other"):
+                # A download can end early without anyone noticing (no length
+                # given). Don't keep it: the next click fetches the clip again.
+                self._cached(self._current).unlink(missing_ok=True)
             self._clip_failed(text)
 
     def _on_clip_ended(self) -> None:

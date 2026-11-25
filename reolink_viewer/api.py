@@ -294,7 +294,7 @@ class CameraApi:
         self._legacy_tls = False
         self._token = ""
         self._token_expires = 0.0
-        self._logged_in_once = False
+        self._login_at = 0.0  # when the camera last handed out a token
 
     # ------------------------------------------------------------- identity
 
@@ -368,9 +368,9 @@ class CameraApi:
             self._token = str(token["name"])
             # Renew a minute early rather than have a command bounce.
             self._token_expires = _now() + max(lease - 60, 30)
-            self._logged_in_once = True
-            log.info("[%s] logged in to the camera's API over %s", self.cam.name,
-                     "HTTPS" if https else "HTTP")
+            self._login_at = _now()
+            log.info("[%s] logged in to the camera's API over %s (session of %.0f s)", self.cam.name,
+                     "HTTPS" if https else "HTTP", lease)
             return
         code, detail = _error_of(item)
         log.warning("[%s] API login refused: %s (%s)", self.cam.name, detail or "no detail", code)
@@ -450,9 +450,11 @@ class CameraApi:
         last: Exception | None = None
         for legacy in modes:
             opener = _opener(tls_context(legacy) if https else None)
+            began = time.monotonic()
             try:
                 with opener.open(request, timeout=timeout) as response:
                     raw = response.read(MAX_RESPONSE_BYTES)
+                    status, kind = response.status, response.headers.get("Content-Type", "?")
             except urllib.error.HTTPError as exc:
                 # A server error may come after the request was handled; a redirect
                 # or "not found" means this isn't the camera's API.
@@ -472,17 +474,23 @@ class CameraApi:
             except ValueError as exc:  # a malformed URL: nothing was sent
                 raise _NoAnswer(_reason(exc)) from None
             self._legacy_tls = legacy
+            took = (time.monotonic() - began) * 1000
             if not expect_json:
+                log.debug("[%s] API %s at %s: HTTP %s, %.0f ms", self.cam.name, cmd, base, status, took)
                 return []
             text = raw.decode("utf-8", "replace")
             try:
                 answer = json.loads(text)
             except ValueError:
-                # A cut-off answer from the camera, or some other web server's page.
-                kind = _Unanswered if text.lstrip()[:1] in ("[", "{") else _NoAnswer
-                raise kind("not a Reolink API answer") from None
+                answer = None
             if not isinstance(answer, list):
-                raise _NoAnswer("not a Reolink API answer")
+                log.debug("[%s] API %s at %s: HTTP %s (%s), %d bytes that aren't an API answer, %.0f ms",
+                          self.cam.name, cmd, base, status, kind, len(raw), took)
+                # A cut-off answer from the camera, or some other web server's page.
+                fault = _Unanswered if answer is None and text.lstrip()[:1] in ("[", "{") else _NoAnswer
+                raise fault("not a Reolink API answer")
+            log.debug("[%s] API %s at %s: HTTP %s (%s), %s, %.0f ms", self.cam.name, cmd, base, status, kind,
+                      _summary(cmd, answer), took)
             return answer
         raise _NoAnswer(_reason(last) if last else "TLS handshake failed")
 
@@ -560,6 +568,11 @@ class CameraApi:
     def uses_https(self) -> bool:
         return self._https
 
+    @property
+    def legacy_tls(self) -> bool:
+        """The camera only managed a TLS handshake with the old settings."""
+        return self._https and self._legacy_tls
+
     # ------------------------------------------------------- zoom and focus
 
     def zoom_focus(self) -> ZoomFocus:
@@ -606,6 +619,18 @@ class CameraApi:
         item = self._command("SetAutoFocus", {
             "AutoFocus": {"disable": 0 if enabled else 1, "channel": self.channel}})
         _check_setting(item)
+
+
+def _summary(cmd: str, answer: list) -> str:
+    """What an answer said, for the log. Never a value: a Login answer holds the token."""
+    item = answer[0] if answer and isinstance(answer[0], dict) else {}
+    if item.get("code") == 0:
+        if cmd == "Login":
+            token = (item.get("value") or {}).get("Token") or {}
+            return f"code 0, token {'given' if token.get('name') else 'missing'}, lease {token.get('leaseTime', '?')}"
+        return "code 0"
+    code, detail = _error_of(item)
+    return f"error {code} ({detail})" if detail else f"error {code}"
 
 
 def _check_setting(item: dict) -> None:

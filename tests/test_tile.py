@@ -185,3 +185,42 @@ def test_pacer_forgets_the_frame_rate_for_a_new_stream(gtk):
     assert pacer._interval == 0.04
     pacer.reset(new_stream=True)
     assert pacer._interval is None and pacer._gap_peak == 0.3  # the cushion is the camera's
+
+
+def test_editing_the_channel_plays_the_new_stream(make_tile, run_loop, caplog):
+    import dataclasses
+
+    tile = make_tile()
+    tile.start()
+    assert run_loop(lambda: tile._status == "Live", 15)
+    with caplog.at_level(logging.INFO, logger="reolink_viewer.player"):
+        tile.set_camera(dataclasses.replace(tile.camera, channel=2))
+        assert run_loop(lambda: connects(caplog) == 1, 5)
+    assert "Preview_02_" in tile._last_uri
+    assert run_loop(lambda: tile._status == "Live", 15)
+
+
+def test_a_camera_edited_into_a_battery_camera_is_not_woken(make_tile, run_loop):
+    import dataclasses
+
+    tile = make_tile()
+    tile.start()
+    assert run_loop(lambda: tile._status == "Live", 15)
+    woken = []
+    tile._wake = lambda cam, stream: woken.append(cam) or "would wake"
+    tile.set_camera(dataclasses.replace(tile.camera, protocol="battery", uid="TESTUID0000000000"))
+    run_loop(lambda: False, 0.5)
+    assert woken == [] and not tile.is_playing
+
+
+def test_callbacks_from_a_replaced_connection_are_ignored(make_tile, run_loop):
+    tile = make_tile()
+    tile.start()
+    assert run_loop(lambda: tile._status == "Live", 15)
+    old = tile._connection
+    tile.restart()
+    assert tile._connection > old
+    tile._status = "Connecting…"
+    assert tile._on_first_frame(old) is False
+    assert tile._status == "Connecting…"  # the old connection's frame didn't make it "Live"
+    assert run_loop(lambda: tile._status == "Live", 15)

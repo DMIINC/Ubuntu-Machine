@@ -25,7 +25,7 @@ from .config import (  # noqa: E402
     load_settings,
     save_settings,
 )
-from . import api, player  # noqa: E402
+from . import api, player, vod  # noqa: E402
 from .dialogs import CameraDialog  # noqa: E402
 from .neolink import Neolink  # noqa: E402
 from .player import CameraTile  # noqa: E402
@@ -59,6 +59,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.focused: CameraTile | None = None
         self.shown: list[CameraTile] = []  # maximized: the focused tile, or all its lenses
         self.is_fullscreen = False
+        self._shut_down = False
         self.set_default_size(1280, 760)
 
         header = Gtk.HeaderBar(show_close_button=True, title=APP_NAME)
@@ -234,7 +235,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.restore()
             else:
                 self.relayout()
-            tile.start()
+            # A battery camera sleeps until the user double-clicks it.
+            if not cam.on_demand and not tile.is_playing:
+                tile.start()
         dlg.destroy()
 
     def edit_camera(self, tile: CameraTile) -> None:
@@ -247,6 +250,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self.neolink.apply(self.settings.cameras)
             self._close_camera_windows(cam.id)  # they hold the old login
             tile.set_camera(cam)
+            # A battery camera turned into an always-on one starts if it's on screen.
+            if (not cam.on_demand and not tile.is_playing
+                    and (self.focused is None or tile in self.shown)):
+                tile.start()
         dlg.destroy()
 
     def remove_camera(self, tile: CameraTile) -> None:
@@ -526,6 +533,9 @@ class MainWindow(Gtk.ApplicationWindow):
     def shut_down(self) -> None:
         """Stop everything before the window goes. Every way of quitting comes
         through here: a pipeline left playing at exit can crash the process."""
+        if self._shut_down:
+            return
+        self._shut_down = True
         self.hide()  # the window disappears at once; the rest takes a moment
         for tile in self.tiles.values():
             tile.dispose()
@@ -572,13 +582,18 @@ class ViewerApp(Gtk.Application):
 
     def do_activate(self):
         if self.window is None:
+            if not self.extra_urls:
+                # Clips downloaded for playing by a run that crashed. Not from the
+                # ad-hoc URL mode: it runs beside the main window and shares the folder.
+                vod.clear_cache()
             player.configure(self.settings.gpu_only)
             self.window = MainWindow(self)
         self.window.present()
 
     def do_shutdown(self):
         if self.window is not None:
-            self.window.neolink.stop()  # in case the window never got to close
+            # Ctrl+C or the session ending don't close the window first.
+            self.window.shut_down()
         api.logout_all()  # give the cameras their API sessions back
         Gtk.Application.do_shutdown(self)
 

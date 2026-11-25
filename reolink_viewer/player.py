@@ -16,7 +16,7 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import Gdk, GLib, Gst, GstVideo, Gtk  # noqa: E402
 
-from .config import Camera, resolve_stream, rtmp_safe  # noqa: E402
+from .config import Camera, redact_text, resolve_stream, rtmp_safe  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -398,6 +398,7 @@ class CameraTile(Gtk.EventBox):
         self._last_error = ""
         self._stream_up = False  # battery camera: neolink has served its stream in this wake
         self._last_uri = ""
+        self._connection = 0  # counts connections, so late callbacks from an old one are ignored
         self._connect_started = 0.0
         self._notice = ""  # a passing message shown in the caption
         self._notice_id = 0
@@ -465,28 +466,32 @@ class CameraTile(Gtk.EventBox):
         if what it plays changed: a rename must not cost a reconnect and a login."""
         old = self.camera
         was_rejected = self._login_rejected
+        old_url = self._playing_url()
         self.camera = camera
-        same_login = (old.host, old.username, old.password) == (
-            camera.host, camera.username, camera.password)
-        if self._plays_the_same(old, camera) and same_login:
+        unchanged = (
+            (old.audio, old.protocol, old.uid, old.host, old.username, old.password)
+            == (camera.audio, camera.protocol, camera.uid, camera.host, camera.username, camera.password)
+            and old_url == self._playing_url()
+        )
+        if unchanged:
             self._update_label()
             return
         self._ext_worked = self._ext_unavailable = False
         self._login_rejected = False  # an edited camera is worth one more try
         self._apply_audio_flag()
-        if self._wanted or (was_rejected and not camera.on_demand):
+        if camera.on_demand and not old.on_demand:
+            self.stop()  # now a battery camera: it sleeps until the user opens it
+        elif self._wanted or (was_rejected and not camera.on_demand):
             self.restart()
         else:
             self._set_status(self._idle_status())
 
-    def _plays_the_same(self, old: Camera, new: Camera) -> bool:
-        if (old.audio, old.protocol, old.uid) != (new.audio, new.protocol, new.uid):
-            return False
+    def _playing_url(self) -> str | None:
+        """The URL this tile plays (or would) with its current settings."""
         try:
-            stream = self.wanted_stream
-            return old.url(resolve_stream(old, stream)) == new.url(resolve_stream(new, stream))
+            return self.camera.url(self.active_stream)
         except ValueError:
-            return False
+            return None
 
     def set_stream_override(self, stream: str | None) -> None:
         if stream == self.stream_override:
@@ -507,6 +512,7 @@ class CameraTile(Gtk.EventBox):
         self._backoff = RETRY_MIN_S
         self._attempt = 0
         self._stream_up = False
+        self._last_error = ""
         if self.camera.on_demand and self._note:
             self._note(self.camera, "wake")
         self._connect()
@@ -514,7 +520,6 @@ class CameraTile(Gtk.EventBox):
     def _connect(self) -> None:
         self._wanted = True
         self._cancel_retry()
-        self._got_frame = False
         self._last_frame = time.monotonic()
         try:
             uri = self.camera.url(self.active_stream)
@@ -687,6 +692,10 @@ class CameraTile(Gtk.EventBox):
             self._sink.pacer.interrupt()
         began = time.monotonic()
         self._playbin.set_state(Gst.State.NULL)
+        # Only now can the old connection deliver nothing more: anything it queued
+        # for the GTK thread meanwhile carries the old number and is ignored.
+        self._connection += 1
+        self._got_frame = False
         took = time.monotonic() - began
         if took > 0.05:  # this runs on the GTK thread: the window was frozen that long
             log.debug("[%s] stopping the stream took %.0f ms", self.camera.name, took * 1000)
@@ -811,10 +820,12 @@ class CameraTile(Gtk.EventBox):
 
     def _on_sdp(self, _source, _sdp) -> None:
         # Runs on rtspsrc's thread: neolink answered DESCRIBE (its media has data).
-        GLib.idle_add(self._step, "sdp")
+        GLib.idle_add(self._step, "sdp", self._connection)
 
-    def _step(self, what: str) -> bool:
+    def _step(self, what: str, connection: int | None = None) -> bool:
         """A battery camera's connection got one step further."""
+        if connection is not None and connection != self._connection:
+            return False  # from a connection that has since been replaced
         if self._wanted:
             self._last_frame = time.monotonic()  # the server is answering: not stalled
             if self._note:
@@ -827,10 +838,12 @@ class CameraTile(Gtk.EventBox):
         self._last_buffer = info.get_buffer()
         if not self._got_frame:
             self._got_frame = True
-            GLib.idle_add(self._on_first_frame)
+            GLib.idle_add(self._on_first_frame, self._connection)
         return Gst.PadProbeReturn.OK
 
-    def _on_first_frame(self) -> bool:
+    def _on_first_frame(self, connection: int) -> bool:
+        if connection != self._connection:
+            return False  # from a connection that has since been replaced
         self._update_scale()  # source size is known now
         if self._wanted:
             self._backoff = RETRY_MIN_S
@@ -847,7 +860,8 @@ class CameraTile(Gtk.EventBox):
     def _on_bus_message(self, _bus, msg: Gst.Message) -> None:
         if msg.type == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
-            log.warning("[%s] error: %s (%s)", self.camera.name, err.message, debug)
+            # The details quote the URL, which for RTMP and HTTP-FLV holds the password.
+            log.warning("[%s] error: %s (%s)", self.camera.name, redact_text(err.message), redact_text(debug))
             self._last_error = _error_reason(err, debug)
             if self.camera.on_demand and self._note:
                 self._note(self.camera, f"failed: {self._last_error}")
